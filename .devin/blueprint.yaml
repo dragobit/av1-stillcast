@@ -14,8 +14,8 @@ initialize: |
     git clone --depth 1 https://aomedia.googlesource.com/aom ~/work/aom
     cmake -S ~/work/aom -B ~/work/aom/build -DCMAKE_BUILD_TYPE=Release \
       -DCONFIG_AV1_ENCODER=0 -DENABLE_TESTS=0 -DENABLE_DOCS=0 \
-      -DENABLE_EXAMPLES=0 -DENABLE_TOOLS=0
-    cmake --build ~/work/aom/build --target aomdec -j"$(nproc)"
+      -DENABLE_EXAMPLES=0 -DENABLE_TOOLS=1
+    cmake --build ~/work/aom/build --target aomdec dump_obu -j"$(nproc)"
   fi
 maintenance: |
   cargo fetch
