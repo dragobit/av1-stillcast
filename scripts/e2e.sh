@@ -166,6 +166,14 @@ grep -q 'seek points) at \[0, 150\]' "$WORK/plinfo.txt"
 grep -q '356 show_existing' "$WORK/plinfo.txt"
 echo "playlist OK: switch at 5s keyframe, pixels verified"
 
+echo "== playlist durations: frames (Nf) and ffmpeg-style time"
+printf '%s 150f\n%s 00:00:05.000\n' "$WORK/src.ivf" "$WORK/src2.ivf" \
+    > "$WORK/list2.txt"
+cargo run --quiet -- assemble --playlist "$WORK/list2.txt" -o "$WORK/pl2.ivf" \
+    --fps 30 --gop 300
+cargo run --quiet -- info -i "$WORK/pl2.ivf" --check | tee "$WORK/pl2info.txt"
+grep -q 'seek points) at \[0, 150\]' "$WORK/pl2info.txt"
+
 echo "== determinism: two runs must be byte-identical"
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.ivf" --frames 300 --gop 300
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.ivf" --frames 300 --gop 300

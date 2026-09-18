@@ -26,8 +26,9 @@ enum Cmd {
         /// --playlist.
         #[arg(short, long, conflicts_with = "playlist")]
         image: Option<PathBuf>,
-        /// Playlist file: one `image_path [seconds]` per line (# comments,
+        /// Playlist file: one `image_path [duration]` per line (# comments,
         /// last entry may omit duration to fill --duration/audio).
+        /// Duration forms: seconds | Ns | Nf (frames) | MM:SS[.mmm] | HH:MM:SS[.mmm].
         #[arg(long)]
         playlist: Option<PathBuf>,
         /// Audio track: .aac/.adts is used as-is, anything else is
@@ -73,8 +74,9 @@ enum Cmd {
         /// Mutually exclusive with --playlist.
         #[arg(short, long, conflicts_with = "playlist")]
         input: Option<PathBuf>,
-        /// Playlist file: one `input.ivf [seconds]` per line (# comments,
+        /// Playlist file: one `input.ivf [duration]` per line (# comments,
         /// last entry may omit duration to fill --duration/--frames).
+        /// Duration forms: seconds | Ns | Nf (frames) | MM:SS[.mmm] | HH:MM:SS[.mmm].
         #[arg(long)]
         playlist: Option<PathBuf>,
         /// Output IVF path.
@@ -239,15 +241,60 @@ fn parse_size(s: &str) -> Result<u64> {
         * mult as f64) as u64)
 }
 
-/// One line of a playlist file: a source (image for `make`, ivf for
-/// `assemble`) plus an optional duration in seconds.
-struct PlaylistEntry {
-    path: PathBuf,
-    seconds: Option<f64>,
+/// Per-segment duration on a playlist line. `Seconds` covers ffmpeg-style
+/// spellings (`12.3`, `12.3s`, `MM:SS.mmm`, `HH:MM:SS.mmm`); `Frames` is
+/// the `Nf` form — exact and fps-independent.
+#[derive(Debug, Clone, Copy)]
+enum SegmentDur {
+    Seconds(f64),
+    Frames(u64),
 }
 
-/// Parse `path [seconds]` lines; `#` comments and blanks skipped. Relative
-/// paths resolve against the playlist's directory.
+/// Parse one duration token: `150f` (frames) | `12.3`/`12.3s` |
+/// `MM:SS[.mmm]` | `HH:MM:SS[.mmm]`.
+fn parse_segment_dur(s: &str) -> Option<SegmentDur> {
+    if let Some(f) = s.strip_suffix('f') {
+        return f
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+            .map(SegmentDur::Frames);
+    }
+    if let Some(t) = s.strip_suffix('s') {
+        return t
+            .parse::<f64>()
+            .ok()
+            .filter(|&v| v > 0.0)
+            .map(SegmentDur::Seconds);
+    }
+    if s.contains(':') {
+        let parts: Vec<&str> = s.split(':').collect();
+        if !(2..=3).contains(&parts.len()) {
+            return None;
+        }
+        let mut secs = 0.0f64;
+        for p in &parts[..parts.len() - 1] {
+            secs = secs * 60.0 + p.parse::<u64>().ok()? as f64;
+        }
+        secs += parts.last()?.parse::<f64>().ok()?;
+        return (secs > 0.0).then_some(SegmentDur::Seconds(secs));
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|&v| v > 0.0)
+        .map(SegmentDur::Seconds)
+}
+
+/// One line of a playlist file: a source (image for `make`, ivf for
+/// `assemble`) plus an optional duration.
+struct PlaylistEntry {
+    path: PathBuf,
+    dur: Option<SegmentDur>,
+}
+
+/// Parse `path [duration]` lines; `#` comments and blanks skipped. Relative
+/// paths resolve against the playlist's directory. Duration forms:
+/// `seconds` | `Ns` | `Nf` (frames) | `MM:SS[.mmm]` | `HH:MM:SS[.mmm]`.
 fn read_playlist(path: &Path) -> Result<Vec<PlaylistEntry>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading playlist {}", path.display()))?;
@@ -258,50 +305,54 @@ fn read_playlist(path: &Path) -> Result<Vec<PlaylistEntry>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (p, secs) = match line.rsplit_once(char::is_whitespace) {
-            Some((head, tail)) if tail.parse::<f64>().is_ok() => (head.trim(), tail.parse().ok()),
+        let (p, dur) = match line.rsplit_once(char::is_whitespace) {
+            Some((head, tail)) if parse_segment_dur(tail).is_some() => {
+                (head.trim(), parse_segment_dur(tail))
+            }
             _ => (line, None),
         };
         let mut pb = PathBuf::from(p.trim_matches('"'));
         if pb.is_relative() {
             pb = dir.join(pb);
         }
-        out.push(PlaylistEntry {
-            path: pb,
-            seconds: secs,
-        });
+        out.push(PlaylistEntry { path: pb, dur });
     }
     anyhow::ensure!(!out.is_empty(), "empty playlist {}", path.display());
     Ok(out)
 }
 
-/// Convert per-segment seconds to frame counts. Every entry needs a
-/// duration except the last, which fills the remainder of `total_secs`
-/// (when given and still needed).
+/// Convert per-segment durations to frame counts. Seconds entries are
+/// rounded to the nearest output frame; `Nf` entries are exact. Every
+/// entry needs a duration except the last, which fills the remainder of
+/// `total_frames` (from --frames or total_secs*fps).
 fn segment_frames(
     entries: &[PlaylistEntry],
     total_secs: Option<f64>,
     fps: u32,
 ) -> Result<Vec<u64>> {
+    let total_frames = total_secs.map(|t| (t * f64::from(fps)).round() as u64);
     let mut frames = Vec::with_capacity(entries.len());
-    let mut used = 0.0f64;
+    let mut used = 0u64;
     for (i, e) in entries.iter().enumerate() {
-        match e.seconds {
-            Some(s) => {
-                anyhow::ensure!(s > 0.0, "entry {}: duration must be > 0", i + 1);
-                frames.push((s * f64::from(fps)).round().max(1.0) as u64);
-                used += s;
+        match e.dur {
+            Some(SegmentDur::Frames(n)) => {
+                frames.push(n.max(1));
+                used += n.max(1);
+            }
+            Some(SegmentDur::Seconds(s)) => {
+                let n = (s * f64::from(fps)).round().max(1.0) as u64;
+                frames.push(n);
+                used += n;
             }
             None if i == entries.len() - 1 => {
-                let total = total_secs
-                    .context("last playlist entry has no duration; pass --duration or --audio")?;
-                let rest = total - used;
+                let total = total_frames.context(
+                    "last playlist entry has no duration; pass --duration/--frames or --audio",
+                )?;
                 anyhow::ensure!(
-                    rest > 0.0,
-                    "total {}s is shorter than the sum of earlier segments ({used}s)",
-                    total
+                    total > used,
+                    "total {total} frames is shorter than the sum of earlier segments ({used}f)",
                 );
-                frames.push((rest * f64::from(fps)).round().max(1.0) as u64);
+                frames.push(total - used);
             }
             None => anyhow::bail!("entry {} needs a duration (only the last may omit)", i + 1),
         }
@@ -526,7 +577,7 @@ fn main() -> Result<()> {
             let entries = match (&image, &playlist) {
                 (Some(img), None) => vec![PlaylistEntry {
                     path: img.clone(),
-                    seconds: duration,
+                    dur: duration.map(SegmentDur::Seconds),
                 }],
                 (None, Some(pl)) => read_playlist(pl)?,
                 _ => anyhow::bail!("need -i <image> or --playlist <file>"),
@@ -638,7 +689,11 @@ fn main() -> Result<()> {
             let entries = match (&input, &playlist) {
                 (Some(i), None) => vec![PlaylistEntry {
                     path: i.clone(),
-                    seconds: if frames.is_some() { None } else { duration },
+                    dur: if frames.is_some() {
+                        None
+                    } else {
+                        duration.map(SegmentDur::Seconds)
+                    },
                 }],
                 (None, Some(pl)) => read_playlist(pl)?,
                 _ => anyhow::bail!("need -i <ivf> or --playlist <file>"),
