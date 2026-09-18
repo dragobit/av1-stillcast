@@ -1,0 +1,62 @@
+name: compat
+
+# Compatibility checks across real players/decoders. Runs on demand and
+# weekly; deliberately separate from `ci` so a flaky player never gates PRs.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+
+jobs:
+  players:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install players
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg mpv vlc-bin
+      - run: ./scripts/compat_players.sh examples/demo.mp4
+
+  firefox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install playwright && python3 -m playwright install --with-deps firefox
+      - name: seek test (mid-GOP seeks + playthrough)
+        run: BROWSER=firefox python3 scripts/browser_seek_test.py examples/demo.mp4
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: play on emulator via MediaCodec
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          disable-animations: true
+          script: |
+            adb push examples/demo.mp4 /sdcard/Movies/demo.mp4
+            adb shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Movies/demo.mp4"
+            sleep 3
+            ID=$(adb shell content query --uri content://media/external/video/media --projection _id | grep -oE '[0-9]+' | tail -1)
+            echo "media id: $ID"
+            adb shell "am start -a android.intent.action.VIEW -d content://media/external/video/media/$ID -t 'video/*'"
+            sleep 12
+            adb shell "dumpsys media.player" > media_player.txt
+            cat media_player.txt
+            # The decoder line proves Android routed our stream through the
+            # platform AV1 decoder (c2.android.av1.decoder, libgav1-based).
+            grep -q 'mime(video/av01)' media_player.txt
+            grep -qE 'decoder\(c2\.(android\.av1\.decoder|[^)]*av1)' media_player.txt
+            # Frames were actually rendered (not just opened and stalled).
+            FRAMES=$(grep -oE 'numFramesTotal\([0-9]+\)' media_player.txt | grep -oE '[0-9]+' | head -1)
+            echo "frames rendered: ${FRAMES:-none}"
+            [ -n "$FRAMES" ] && [ "$FRAMES" -gt 60 ]
