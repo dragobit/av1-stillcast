@@ -23,6 +23,7 @@ seek). ✅ verified, ⬜ untested, ⚠️ partial/known issue.
 | Safari (Apple silicon AV1 hw) | ⬜ | ⬜ | ⬜ | hw only, M3+/A17+ |
 | Android MediaCodec AV1 | ⬜ | ⬜ | ⬜ | |
 | YouTube ingest | ⬜ | — | — | upload unlisted; does it accept av01 mp4? |
+| HTTP range seek (progressive) | ✅ | ✅ | — | 45 MB / 1 h file over plain HTTP: Chrome computed byte offsets from the front-loaded moov tables and issued mid-file `Range` requests only (starts at 34.9 MB for t=2700 s, 41.6 MB for t=3300 s); `seeked` in ~220–250 ms. Verified on a 206-capable local server. |
 
 How to report: edit this table in a PR with device/browser versions and
 observed behavior (warnings, stalls, fallback to sw decode). Browser
