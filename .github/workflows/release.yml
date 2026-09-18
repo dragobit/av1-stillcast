@@ -1,0 +1,42 @@
+name: release
+
+# Tag push -> static musl binaries (Alpine-compatible) on GitHub Releases.
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,zig
+      - name: build
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: package
+        run: |
+          pkg=stillcast-${GITHUB_REF_NAME}-linux-${{ matrix.target }}
+          mkdir -p "$pkg"
+          cp "target/${{ matrix.target }}/release/stillcast" "$pkg/"
+          cp README.md LICENSE "$pkg/"
+          tar -czf "$pkg.tar.gz" "$pkg"
+          sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            stillcast-${{ github.ref_name }}-linux-${{ matrix.target }}.tar.gz
+            stillcast-${{ github.ref_name }}-linux-${{ matrix.target }}.tar.gz.sha256
