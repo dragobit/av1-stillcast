@@ -1,8 +1,10 @@
 # https://docs.devin.ai/onboard-devin/environment-yaml
 initialize: |
-  # Rust toolchain + ffmpeg (e2e encode/decode verification)
+  # Rust toolchain + ffmpeg (e2e encode/decode verification) + playwright
+  # (browser_seek_test.py CDP client; connects to the running Chrome)
   command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+  pip3 install playwright
 maintenance: |
   cargo fetch
 knowledge:
@@ -12,6 +14,9 @@ knowledge:
   - name: test
     contents: |
       cargo test && ./scripts/e2e.sh
+  - name: browser-test
+    contents: |
+      CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/demo.mp4
   - name: notes
     contents: |
       ffmpeg provides libaom-av1 (encode) and libdav1d (decode-verify); the e2e

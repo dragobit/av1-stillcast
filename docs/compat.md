@@ -11,20 +11,23 @@ seek). ✅ verified, ⬜ untested, ⚠️ partial/known issue.
 | decoder / player | play | mid-seek | sync | notes |
 |---|---|---|---|---|
 | libdav1d (sw decoder) | ✅ | ✅ | ✅ | e2e-verified, frame-exact |
+| ffmpeg demux+seek path | ✅ | ✅ | ✅ | `-ss` lands on prior stss keyframe; `-copyts` output starts at exact target pts |
 | ffmpeg `av1` native decoder | ⬜ | ⬜ | ⬜ | untested (fails in our env on all av1 files) |
 | libgav1 | ⬜ | ⬜ | ⬜ | |
 | ffplay | ⬜ | ⬜ | ⬜ | |
 | VLC | ⬜ | ⬜ | ⬜ | |
 | mpv | ⬜ | ⬜ | ⬜ | |
 | Windows Media Foundation (AV1 ext.) | ⬜ | ⬜ | ⬜ | |
-| Chrome (dav1d/hw) | ⬜ | ⬜ | ⬜ | file:// or MSE |
+| Chrome 137 (dav1d/hw) | ✅ | ✅ | ✅ | `scripts/browser_seek_test.py`: mid-GOP seeks complete in 4–13 ms, `seeked` fires, `currentTime` preserved (rewind-to-keyframe + fast-forward through cheap TUs), playthrough OK |
 | Firefox | ⬜ | ⬜ | ⬜ | |
 | Safari (Apple silicon AV1 hw) | ⬜ | ⬜ | ⬜ | hw only, M3+/A17+ |
 | Android MediaCodec AV1 | ⬜ | ⬜ | ⬜ | |
 | YouTube ingest | ⬜ | — | — | upload unlisted; does it accept av01 mp4? |
 
 How to report: edit this table in a PR with device/browser versions and
-observed behavior (warnings, stalls, fallback to sw decode).
+observed behavior (warnings, stalls, fallback to sw decode). Browser
+cells are best filled with `scripts/browser_seek_test.py` (Playwright
+CDP) so mid-GOP seek behavior is measured, not eyeballed.
 
 Known-spec risks this matrix measures:
 - Streams that are >97% show_existing are unusual in the wild.
