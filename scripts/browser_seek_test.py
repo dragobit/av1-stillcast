@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Browser seek/playback compat test for stillcast outputs.
 
-Drives a real Chrome over CDP (Playwright), opens an mp4 directly in a tab
-(Chrome's own media pipeline — dav1d/hw decode path), seeks to mid-GOP
-positions, and asserts the HTMLMediaElement contract:
+Opens an mp4 in a real browser, seeks to mid-GOP positions, and asserts the
+HTMLMediaElement contract:
 
   - 'seeked' fires within a timeout (no decoder stall on our weird stream)
   - currentTime lands at the requested time (browser rewound to the
@@ -11,9 +10,14 @@ positions, and asserts the HTMLMediaElement contract:
   - readyState >= HAVE_FUTURE_DATA, no MediaError
 
 Usage:
-  CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py [file.mp4]
+  BROWSER=chrome  CDP_URL=http://localhost:29229  (attach to a running Chrome
+                                                  via --remote-debugging-port)
+  BROWSER=firefox                                 (playwright-managed, headless)
+  BROWSER=chromium                                (playwright-managed, headless)
+  python3 scripts/browser_seek_test.py [file.mp4]
 
-Requires: pip install playwright; a Chrome with --remote-debugging-port.
+Requires: pip install playwright; playwright install firefox / chromium for
+managed launches, or a Chrome with --remote-debugging-port for CDP attach.
 """
 import json
 import os
@@ -28,10 +32,18 @@ def main() -> int:
     mp4 = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "examples", "demo.mp4")
     )
-    cdp = os.environ.get("CDP_URL", "http://localhost:29229")
+    browser_name = os.environ.get("BROWSER", "chrome")
 
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(cdp)
+        if browser_name == "chrome":
+            cdp = os.environ.get("CDP_URL", "http://localhost:29229")
+            browser = p.chromium.connect_over_cdp(cdp)
+        elif browser_name in ("firefox", "chromium"):
+            launcher = getattr(p, browser_name)
+            browser = launcher.launch(headless=True)
+        else:
+            print(f"FAIL: unknown BROWSER={browser_name} (chrome|firefox|chromium)")
+            return 1
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
         page = ctx.new_page()
         page.goto(f"file://{mp4}")
