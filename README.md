@@ -92,7 +92,11 @@ seek points.
 ```bash
 cargo build --release
 cargo test            # unit tests
-./scripts/e2e.sh      # end-to-end: encode → assemble → dav1d decode-verify
+./scripts/e2e.sh      # end-to-end: encode → assemble → dav1d decode-verify,
+                      # mp4/ffprobe checks, seek landing, determinism
+
+# real-browser seek test (needs Chrome with --remote-debugging-port):
+CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/demo.mp4
 ```
 
 ## Roadmap

@@ -46,6 +46,19 @@ echo "decoded frames: $DECODED (expected 900)"
 echo "== remux + seek sanity"
 ffmpeg -hide_banner -loglevel error -ss 20 -i "$WORK/out.mp4" -frames:v 1 -f null -
 
+echo "== seek lands on prior keyframe, output starts at target"
+# -ss mid-GOP + -copyts: first output pts must be the requested time
+# (demuxer used stss to land on the previous keyframe, decoded forward)
+FIRST=$(ffmpeg -hide_banner -ss 21.5 -copyts -i "$WORK/out.mp4" \
+    -vf showinfo -frames:v 1 -f null - 2>&1 | grep -oE 'pts_time:[0-9.]+' \
+    | head -1 | cut -d: -f2)
+echo "first output pts after -ss 21.5: $FIRST"
+[ "$FIRST" = "21.5" ]
+KEYS=$(ffprobe -v error -select_streams v -show_entries packet=pts_time,flags \
+    -of csv=p=0 "$WORK/out.mp4" | grep -c 'K_')
+echo "keyframe packets: $KEYS (expected 3: gop 300 over 900 frames)"
+[ "$KEYS" = "3" ]
+
 echo "== stillcast make (image + audio -> mp4 in one step)"
 cargo run --quiet -- make -i "$WORK/still.png" -a "$WORK/audio.aac" \
     -o "$WORK/made.mp4" --gop 300
