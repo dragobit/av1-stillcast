@@ -1,7 +1,10 @@
 //! Minimal ISOBMFF (MP4) writer for the static-video use case.
 //!
-//! Layout: ftyp | mdat | moov — moov is emitted last so chunk offsets are
-//! computed in a single deterministic pass. Each track lives in one chunk
+//! Layout: ftyp | moov | mdat — "faststart": the sample tables sit before
+//! the media data so players can start and seek without reaching the end of
+//! the file. moov size is stco-independent, so we build it once to measure,
+//! then rebuild with real chunk offsets — still fully deterministic.
+//! Each track lives in one chunk
 //! (samples are cheap show_existing TUs; interleaving buys nothing).
 //! No B-frames ever exist in our streams, so decode order == presentation
 //! order and no ctts is needed.
@@ -364,12 +367,10 @@ pub fn write(video: &VideoTrack, audio: Option<&AudioTrack>) -> Result<Vec<u8>> 
     };
     let movie_dur_ms = v_dur_ms.max(a_dur_ms);
 
-    // layout: ftyp | mdat(header+samples) | moov — chunk offsets are already
-    // known before moov is built, so a single pass suffices.
-    let v_chunk_off = (ftyp.len() + 8 + v_off) as u32;
-    let a_chunk_off = (ftyp.len() + 8 + a_off) as u32;
-
-    let moov = {
+    // layout: ftyp | moov | mdat — faststart. stco doesn't depend on its own
+    // values (one fixed-size entry per chunk), so build moov once to measure
+    // it, then rebuild with real chunk offsets.
+    let build_moov = |v_chunk_off: u32, a_chunk_off: u32| {
         let vt = tables(
             &video.samples,
             video.sample_delta,
@@ -407,12 +408,20 @@ pub fn write(video: &VideoTrack, audio: Option<&AudioTrack>) -> Result<Vec<u8>> 
         bx(b"moov", &moov)
     };
 
-    let mut out = Vec::with_capacity(ftyp.len() + 8 + mdat_payload.len() + moov.len());
+    let moov_len = build_moov(0, 0).len();
+    let mdat_data_off = ftyp.len() + moov_len + 8; // ftyp + moov + mdat header
+    let moov = build_moov(
+        (mdat_data_off + v_off) as u32,
+        (mdat_data_off + a_off) as u32,
+    );
+    debug_assert_eq!(moov.len(), moov_len);
+
+    let mut out = Vec::with_capacity(ftyp.len() + moov.len() + 8 + mdat_payload.len());
     out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&moov);
     out.extend_from_slice(&(mdat_payload.len() as u32 + 8).to_be_bytes());
     out.extend_from_slice(b"mdat");
     out.extend_from_slice(&mdat_payload);
-    out.extend_from_slice(&moov);
     Ok(out)
 }
 
