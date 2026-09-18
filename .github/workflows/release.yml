@@ -22,9 +22,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,zig
+          tool: cargo-zigbuild
       - name: build
         run: cargo zigbuild --release --target ${{ matrix.target }}
       - name: package
