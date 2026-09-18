@@ -87,6 +87,19 @@ impl BitWriter {
         }
     }
 
+    /// uvlc(): unsigned variable-length code — leading_zeros 0-bits, a 1,
+    /// then a leading_zeros-bit suffix.
+    pub fn uvlc(&mut self, v: u64) {
+        let leading_zeros = 63 - (v + 1).leading_zeros() as usize;
+        for _ in 0..leading_zeros {
+            self.f(1, 0);
+        }
+        self.f(1, 1);
+        if leading_zeros > 0 {
+            self.f(leading_zeros, (v + 1) & ((1u64 << leading_zeros) - 1));
+        }
+    }
+
     /// AV1 trailing_bits: a single 1 bit followed by zero padding to a byte boundary.
     pub fn trailing_bits(&mut self) {
         self.f(1, 1);

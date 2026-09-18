@@ -12,7 +12,7 @@ use crate::bitio::BitWriter;
 use crate::frame_header::{self, KEY_FRAME};
 use crate::ivf::IvfFile;
 use crate::obu::{parse_obus, Obu, ObuType};
-use crate::seq_header::SequenceHeader;
+use crate::seq_header::{self, SequenceHeader};
 
 /// Parameters controlling the assembled stream.
 pub struct AssembleParams {
@@ -45,6 +45,25 @@ fn tu_has_seq_header(tu: &[u8]) -> Result<bool> {
     Ok(parse_obus(tu)?
         .iter()
         .any(|o| o.obu_type == ObuType::SequenceHeader))
+}
+
+/// Rewrite `tu`, replacing the sequence header OBU payload with `new_payload`
+/// (all other OBUs verbatim).
+fn tu_replace_seq_header(tu: &[u8], new_payload: &[u8]) -> Result<TemporalUnit> {
+    let mut out = Vec::with_capacity(tu.len() + 32);
+    for obu in parse_obus(tu)? {
+        if obu.obu_type == ObuType::SequenceHeader {
+            Obu {
+                obu_type: ObuType::SequenceHeader,
+                extension: obu.extension,
+                payload: new_payload.to_vec(),
+            }
+            .write(&mut out);
+        } else {
+            obu.write(&mut out);
+        }
+    }
+    Ok(out)
 }
 
 /// Build a temporal delimiter + show_existing_frame frame-header TU.
@@ -110,6 +129,28 @@ pub fn assemble(
     let sh = crate::seq_header::parse_sequence_header(&seq_payload)?;
     sh.check_supported()
         .context("sequence header enables features this assembler does not support")?;
+
+    // Streams that don't declare timing get it injected: a constant-rate
+    // timing_info matching the output fps. This leaves frame headers
+    // untouched (no decoder model bits) while making the bitstream itself
+    // declare its rate — and lays the equal_picture_interval groundwork for
+    // decoder_model_info later.
+    let key_tu_owned;
+    let (sh, key_tu, seq_header_obu) = if !sh.timing_info_present {
+        let sh2 = seq_header::with_timing_info(&sh, params.fps.max(1));
+        let payload = seq_header::emit_sequence_header(&sh2);
+        let mut obu_bytes = Vec::new();
+        Obu {
+            obu_type: ObuType::SequenceHeader,
+            extension: None,
+            payload: payload.clone(),
+        }
+        .write(&mut obu_bytes);
+        key_tu_owned = tu_replace_seq_header(key_tu, &payload)?;
+        (sh2, key_tu_owned.as_slice(), obu_bytes)
+    } else {
+        (sh, key_tu, seq_header_obu)
+    };
 
     let key_info = tu_frame_info(key_tu, &sh)?;
     anyhow::ensure!(
