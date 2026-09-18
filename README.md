@@ -102,6 +102,24 @@ Each emitted GOP is: keyframe TU → golden TU → `show_existing_frame` TU ×
 boundary a new coded video sequence restarts the pattern, giving uniform
 seek points.
 
+### Inspecting / verifying the stream structure
+
+`stillcast info` on an assembled stream dumps or validates exactly the
+structure above — frame type per TU, which reference slot each
+show_existing rediscovers, refresh flags, and the invariants the design
+relies on:
+
+```bash
+stillcast info -i out.ivf --verbose   # per-TU dump (works on .mp4 too)
+stillcast info -i out.mp4 --check     # assert invariants, nonzero exit on fail
+```
+
+`--check` verifies: first TU is a shown KEY_FRAME, no `show_existing`
+ever re-displays a keyframe (spec-forbidden), every TU shows a frame, and
+every non-key coded frame is `INTER`+showable. `ffprobe -show_frames`
+(2 I-frames, rest P) and the AV1 reference decoder `aomdec` provide
+independent cross-checks of the same structure.
+
 ## Build & test
 
 ```bash
