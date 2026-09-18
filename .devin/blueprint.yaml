@@ -4,9 +4,19 @@ initialize: |
   # + player binaries (compat_players.sh) + playwright firefox build
   # (BROWSER=firefox headless seek test)
   command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-  sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg mpv vlc-bin
+  sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg mpv vlc-bin cmake nasm
   pip3 install playwright
   python3 -m playwright install firefox
+  # aomdec: AV1 reference decoder for strict conformance verification
+  # (decode-only build; compat.yml's reference-decoder job mirrors this)
+  if [ ! -x ~/work/aom/build/aomdec ]; then
+    mkdir -p ~/work
+    git clone --depth 1 https://aomedia.googlesource.com/aom ~/work/aom
+    cmake -S ~/work/aom -B ~/work/aom/build -DCMAKE_BUILD_TYPE=Release \
+      -DCONFIG_AV1_ENCODER=0 -DENABLE_TESTS=0 -DENABLE_DOCS=0 \
+      -DENABLE_EXAMPLES=0 -DENABLE_TOOLS=0
+    cmake --build ~/work/aom/build --target aomdec -j"$(nproc)"
+  fi
 maintenance: |
   cargo fetch
 knowledge:
