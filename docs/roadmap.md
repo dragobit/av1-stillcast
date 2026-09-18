@@ -42,8 +42,12 @@ Status:
 - ✅ `stillcast plan -i src.ivf --duration 3600` — gop sweep table:
   stream bytes, kbps, worst-case seek latency.
 - ✅ `--target-seek N` on `make`/`assemble` — picks `gop = N×fps`.
-- Remaining: `--max-size` (CRF solving needs a re-encode loop), a CRF
-  column in the sweep, `--explain` output.
+- ✅ `--max-size` — `assemble` grows gop geometrically until the file
+  fits (seek granularity degrades, warns); `make` walks a crf ladder
+  (requested → 40/48/56/63) re-encoding until it fits. Both measure
+  the real output bytes, not the model.
+- Remaining: a CRF column in the plan sweep, `--explain` output,
+  multi-image playlists.
 
 No extra dependencies; the model needs only `kf_size` (measured) and
 constants already known (~6 B/TU + container overhead ~4 B/sample).

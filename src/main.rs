@@ -47,6 +47,10 @@ enum Cmd {
         /// libaom constant-quality level for the real frames.
         #[arg(long, default_value_t = 32)]
         crf: u32,
+        /// Max output size (e.g. 5MB, 500KB, bytes). Raises crf until it fits
+        /// (keeps gop/seek granularity).
+        #[arg(long)]
+        max_size: Option<String>,
         /// AAC bitrate when transcoding non-ADTS audio.
         #[arg(long, default_value = "96k")]
         audio_bitrate: String,
@@ -77,9 +81,14 @@ enum Cmd {
         /// Alternative to --gop: pick gop = target_seek_seconds * fps.
         #[arg(long)]
         target_seek: Option<f64>,
-        /// Optional ADTS (.aac) audio to mux into mp4 output.
+        /// Optional audio to mux into mp4 output (.aac/.adts used as-is,
+        /// anything else transcoded to AAC via ffmpeg).
         #[arg(long)]
         audio: Option<PathBuf>,
+        /// Max output size (e.g. 5MB, 500KB, bytes). Raises gop until it
+        /// fits (degrades seek granularity; video only gets smaller).
+        #[arg(long)]
+        max_size: Option<String>,
     },
     /// Size/seek frontier: project stream size and worst seek latency per gop.
     Plan {
@@ -115,6 +124,30 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
         anyhow::bail!("{what} failed:\n{}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
+}
+
+/// Encode the still image to a short ivf (keyframe + golden inter frames).
+fn encode_still(image: &Path, fps: u32, crf: u32, dest: &Path) -> Result<()> {
+    run(
+        Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-loop",
+                "1",
+                "-i",
+            ])
+            .arg(image)
+            .args(["-vf", "format=yuv420p", "-c:v", "libaom-av1", "-crf"])
+            .arg(crf.to_string())
+            .args(["-b:v", "0", "-cpu-used", "8", "-r"])
+            .arg(fps.to_string())
+            .args(["-frames:v", "4"])
+            .arg(dest),
+        "libaom encode",
+    )
 }
 
 fn ffprobe_duration(path: &Path) -> Result<f64> {
@@ -153,15 +186,41 @@ fn fmt_bytes(b: u64) -> String {
     }
 }
 
-fn assemble_to_file(
+fn is_mp4_path(path: &Path) -> bool {
+    path.extension().map(|e| e == "mp4").unwrap_or(false)
+}
+
+fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix("MB") {
+        (n, 1 << 20)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n, 1 << 10)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1 << 20)
+    } else if let Some(n) = s.strip_suffix('K') {
+        (n, 1 << 10)
+    } else {
+        (s, 1)
+    };
+    Ok((num
+        .trim()
+        .parse::<f64>()
+        .with_context(|| format!("bad size {s}"))?
+        * mult as f64) as u64)
+}
+
+/// Build the output file bytes in memory (ivf or mp4) without writing.
+/// Returns (bytes, n_samples, golden_slot, eff_fps, total_frames).
+fn build_output(
     input: &Path,
-    output: &Path,
+    is_mp4: bool,
     fps: Option<u32>,
     duration: Option<f64>,
     frames: Option<u64>,
     gop: u64,
     audio: Option<&Path>,
-) -> Result<()> {
+) -> Result<(Vec<u8>, usize, u8, u32, u64)> {
     let data = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
     let (key_tu, golden_tu) = stillcast::assemble::split_input(&ivf).context("splitting input")?;
@@ -187,8 +246,8 @@ fn assemble_to_file(
     };
     let out = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
     let n_samples = out.tus.len();
+    let golden_slot = out.golden_slot;
 
-    let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
     if audio.is_some() && !is_mp4 {
         anyhow::bail!("--audio requires mp4 output (-o out.mp4)");
     }
@@ -234,16 +293,69 @@ fn assemble_to_file(
         let out_ivf = stillcast::assemble::to_ivf(&ivf, out.tus, fps);
         stillcast::ivf::write(&out_ivf)
     };
-    std::fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
+    Ok((bytes, n_samples, golden_slot, eff_fps, total))
+}
+
+fn write_output(
+    output: &Path,
+    bytes: &[u8],
+    n_samples: usize,
+    golden_slot: u8,
+    gop: u64,
+) -> Result<()> {
+    std::fs::write(output, bytes).with_context(|| format!("writing {}", output.display()))?;
     println!(
         "wrote {}: {} frames, {} B, golden slot {}, gop {}",
         output.display(),
         n_samples,
         bytes.len(),
-        out.golden_slot,
+        golden_slot,
         gop
     );
     Ok(())
+}
+
+/// Transcode audio to ADTS via ffmpeg into `work_dir`, or return the
+/// original path when it is already ADTS.
+fn ensure_adts(audio: &Path, work_dir: &Path, bitrate: &str) -> Result<PathBuf> {
+    if is_adts(audio) {
+        return Ok(audio.to_path_buf());
+    }
+    let out = work_dir.join("audio.aac");
+    run(
+        Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(audio)
+            .args(["-c:a", "aac", "-b:a", bitrate, "-f", "adts"])
+            .arg(&out),
+        "audio transcode",
+    )?;
+    Ok(out)
+}
+
+/// Grow gop geometrically until the produced file fits `max_bytes`.
+/// Returns (bytes, n_samples, golden_slot, chosen gop, fits_budget).
+#[allow(clippy::too_many_arguments)]
+fn fit_gop_for_size(
+    input: &Path,
+    is_mp4: bool,
+    fps: Option<u32>,
+    duration: Option<f64>,
+    frames: Option<u64>,
+    gop: u64,
+    audio: Option<&Path>,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, usize, u8, u64, bool)> {
+    let mut g = gop.max(2);
+    loop {
+        let (bytes, n, slot, _fps, total) =
+            build_output(input, is_mp4, fps, duration, frames, g, audio)?;
+        let fits = bytes.len() as u64 <= max_bytes;
+        if fits || g >= total {
+            return Ok((bytes, n, slot, g, fits));
+        }
+        g = (g.saturating_mul(2)).min(total);
+    }
 }
 
 fn main() -> Result<()> {
@@ -258,6 +370,7 @@ fn main() -> Result<()> {
             gop,
             target_seek,
             crf,
+            max_size,
             audio_bitrate,
             keep_work,
         } => {
@@ -272,45 +385,9 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&work)?;
             let src_ivf = work.join("src.ivf");
 
-            run(
-                Command::new("ffmpeg")
-                    .args([
-                        "-y",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-loop",
-                        "1",
-                        "-i",
-                    ])
-                    .arg(&image)
-                    .args(["-vf", "format=yuv420p", "-c:v", "libaom-av1", "-crf"])
-                    .arg(crf.to_string())
-                    .args(["-b:v", "0", "-cpu-used", "8", "-r"])
-                    .arg(fps.to_string())
-                    .args(["-frames:v", "4"])
-                    .arg(&src_ivf),
-                "libaom encode",
-            )?;
-
-            let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
+            let is_mp4 = is_mp4_path(&output);
             let aac = match &audio {
-                Some(a) if is_mp4 => {
-                    if is_adts(a) {
-                        Some(a.clone())
-                    } else {
-                        let aac = work.join("audio.aac");
-                        run(
-                            Command::new("ffmpeg")
-                                .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-                                .arg(a)
-                                .args(["-c:a", "aac", "-b:a", &audio_bitrate, "-f", "adts"])
-                                .arg(&aac),
-                            "audio transcode",
-                        )?;
-                        Some(aac)
-                    }
-                }
+                Some(a) if is_mp4 => Some(ensure_adts(a, &work, &audio_bitrate)?),
                 _ => None,
             };
 
@@ -324,15 +401,57 @@ fn main() -> Result<()> {
             };
             let gop = resolve_gop(gop, target_seek, fps);
 
-            assemble_to_file(
-                &src_ivf,
-                &output,
-                Some(fps),
-                duration,
-                None,
-                gop,
-                aac.as_deref(),
-            )?;
+            // CRF ladder when a size budget is given: first fit wins.
+            let mut crfs = vec![crf];
+            if max_size.is_some() {
+                for c in [40u32, 48, 56, 63] {
+                    if c > crf {
+                        crfs.push(c);
+                    }
+                }
+            }
+            let budget: Option<u64> = max_size.map(|s| parse_size(&s)).transpose()?;
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut chosen: Option<(Vec<u8>, usize, u8, u32)> = None; // bytes,n,slot,crf_used
+            for c in &crfs {
+                encode_still(&image, fps, *c, &src_ivf)?;
+                match build_output(
+                    &src_ivf,
+                    is_mp4,
+                    Some(fps),
+                    duration,
+                    None,
+                    gop,
+                    aac.as_deref(),
+                ) {
+                    Ok((bytes, n, slot, _, _)) => {
+                        let fits = budget.map(|b| bytes.len() as u64 <= b).unwrap_or(true);
+                        chosen = Some((bytes, n, slot, *c));
+                        if fits {
+                            break;
+                        }
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            let (bytes, n, slot, crf_used) = match (chosen, last_err) {
+                (Some(c), _) => c,
+                (None, Some(e)) => return Err(e),
+                (None, None) => unreachable!(),
+            };
+            if let (Some(b), _) = (budget, &bytes) {
+                if bytes.len() as u64 > b {
+                    eprintln!(
+                        "warning: could not fit {}: best is {} at crf {}",
+                        fmt_bytes(b),
+                        fmt_bytes(bytes.len() as u64),
+                        crf_used
+                    );
+                } else if crf_used != crf {
+                    eprintln!("note: raised crf to {} to fit {}", crf_used, fmt_bytes(b));
+                }
+            }
+            write_output(&output, &bytes, n, slot, gop)?;
 
             if !keep_work {
                 let _ = std::fs::remove_dir_all(&work);
@@ -347,17 +466,53 @@ fn main() -> Result<()> {
             gop,
             target_seek,
             audio,
+            max_size,
         } => {
             let eff_fps = fps.unwrap_or(30);
-            assemble_to_file(
-                &input,
-                &output,
-                fps,
-                duration,
-                frames,
-                resolve_gop(gop, target_seek, eff_fps),
-                audio.as_deref(),
-            )?;
+            let gop = resolve_gop(gop, target_seek, eff_fps);
+            let is_mp4 = is_mp4_path(&output);
+
+            // Non-ADTS audio gets transcoded via ffmpeg into a temp dir.
+            let work = std::env::temp_dir().join(format!("stillcast-{}", std::process::id()));
+            let aac = match &audio {
+                Some(a) if is_mp4 => {
+                    std::fs::create_dir_all(&work)?;
+                    Some(ensure_adts(a, &work, "96k")?)
+                }
+                _ => audio.clone(),
+            };
+
+            match max_size.map(|s| parse_size(&s)).transpose()? {
+                Some(budget) => {
+                    let (bytes, n, slot, g, fits) = fit_gop_for_size(
+                        &input,
+                        is_mp4,
+                        fps,
+                        duration,
+                        frames,
+                        gop,
+                        aac.as_deref(),
+                        budget,
+                    )?;
+                    if !fits {
+                        eprintln!(
+                            "warning: could not fit {}: smallest is {} at gop {}",
+                            fmt_bytes(budget),
+                            fmt_bytes(bytes.len() as u64),
+                            g
+                        );
+                    } else if g != gop {
+                        eprintln!("note: raised gop to {} to fit {}", g, fmt_bytes(budget));
+                    }
+                    write_output(&output, &bytes, n, slot, g)?;
+                }
+                None => {
+                    let (bytes, n, slot, _, _) =
+                        build_output(&input, is_mp4, fps, duration, frames, gop, aac.as_deref())?;
+                    write_output(&output, &bytes, n, slot, gop)?;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&work);
         }
         Cmd::Plan {
             input,
