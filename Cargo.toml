@@ -1,0 +1,13 @@
+[package]
+name = "stillcast"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "AV1 bitstream assembler specialized for static-image videos (podcasts, music) using show_existing_frame + long-lived golden references"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
