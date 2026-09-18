@@ -82,6 +82,21 @@ stillcast assemble -i src.ivf -o out.ivf --duration 3600 --max-size 2MB
 ffmpeg -i out.ivf -c copy out.mkv
 ```
 
+Multi-image playlists (e.g. per-song jacket switches in an album video) —
+each switch lands on a real keyframe, so every segment start is a seek
+point:
+
+```bash
+stillcast make --playlist tracks.txt -a album.m4a -o album.mp4
+# tracks.txt — `path [seconds]` per line, `#` comments; the last entry may
+# omit its duration and fills the rest of the audio/--duration:
+#   cover1.png  180
+#   cover2.png  45.5
+#   cover3.png           # remainder
+stillcast assemble --playlist encoded.txt -o out.ivf --duration 3600
+# encoded.txt lists .ivf sources instead of images
+```
+
 Each emitted GOP is: keyframe TU → golden TU → `show_existing_frame` TU ×
 (gop−2). The golden is re-shown for every remaining frame; at each GOP
 boundary a new coded video sequence restarts the pattern, giving uniform
@@ -116,7 +131,8 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
       (gop = N×fps), `--max-size` (assemble: gop growth, make: crf ladder)
 - [ ] Compatibility matrix: hw decoders, browsers, mobile players
       → [`docs/compat.md`](docs/compat.md)
-- [ ] Multi-image playlists (multiple goldens, timed image switches)
+- [x] Multi-image playlists: `--playlist` on `make`/`assemble`, timed
+      switches, every switch is a keyframe (a real seek point)
 - [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
       (`av1_stillcast` bsf) — an *additional* path, not a replacement for
       the CLI flow above

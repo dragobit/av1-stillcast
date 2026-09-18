@@ -25,6 +25,24 @@ GOP (repeated):
 - `gop` is the single knob on the size ↔ seek frontier:
   bitrate ≈ keyframe_bits/gop + fps×6 B;  seek error < gop frames.
 
+### Segments (`--playlist`)
+
+A playlist is a sequence of **segments** — each with its own 2-frame encode
+(own keyframe + own golden). Segments are emitted back to back; every
+segment boundary starts with a shown keyframe, so:
+
+- each switch is a real random-access point (`stss` entry, DPB reset) — no
+  reference-slot juggling across images;
+- within a segment the same GOP pattern repeats (golden re-shown for every
+  remaining frame);
+- a 1-frame segment emits just its keyframe TU.
+
+Constraint: all segments must share a byte-identical sequence-header
+payload — same dimensions/colour/encoder settings. `make` enforces this by
+running every image through the same encode settings; `assemble` rejects
+mismatched inputs. Decoder-model flag splicing walks a single shared DPB
+model across segments in decode order.
+
 ## Crate layout
 
 | module | role |
@@ -63,7 +81,7 @@ creation/modification times are zeroed to keep output byte-deterministic.
 - **Encoding** — libaom/ffmpeg remains the frame factory. Later we may drive
   it for a one-command flow.
 - **Refreshed/motion content** — the target is exactly-static visuals.
-  Periodic jacket changes could be layered later as additional golden frames.
+  Timed image switches exist via `--playlist` (per-segment keyframes).
 
 ## Path to ffmpeg
 

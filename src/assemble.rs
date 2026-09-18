@@ -139,6 +139,17 @@ pub struct AssembleOutput {
     pub seq_header_obu: Vec<u8>,
 }
 
+/// One display segment of a multi-image stream: an image's (key TU, golden
+/// TU) pair plus how long it is shown. Every segment must carry a sequence
+/// header byte-identical to the first segment's (same encode settings and
+/// dimensions); segment boundaries are always shown KEY_FRAMEs, which reset
+/// the DPB, so each image gets a fresh reference-slot slate.
+pub struct Segment<'a> {
+    pub key_tu: &'a [u8],
+    pub golden_tu: &'a [u8],
+    pub frames: u64,
+}
+
 /// Assemble the output temporal units.
 ///
 /// `key_tu`: TU containing (optionally seq header) + shown KEY_FRAME.
@@ -150,10 +161,30 @@ pub fn assemble(
     golden_tu: &[u8],
     params: &AssembleParams,
 ) -> Result<AssembleOutput> {
-    // --- validate the input TUs ---
+    assemble_multi(
+        &[Segment {
+            key_tu,
+            golden_tu,
+            frames: params.total_frames,
+        }],
+        params,
+    )
+}
+
+/// Multi-image variant: `segments` plays in order; each segment is carved
+/// into <= `gop_size` chunks of `key + golden + show_existing` so seek
+/// granularity (== max keyframe distance) is preserved across image switches.
+pub fn assemble_multi(segments: &[Segment], params: &AssembleParams) -> Result<AssembleOutput> {
+    anyhow::ensure!(!segments.is_empty(), "no segments");
+    anyhow::ensure!(
+        params.gop_size >= 2,
+        "gop size must be >= 2 (keyframe + golden)"
+    );
+
+    // --- canonical sequence header from segment 0; all segments must match ---
     let mut seq_header_obu = Vec::new();
     let mut seq_payload = None;
-    for obu in parse_obus(key_tu)? {
+    for obu in parse_obus(segments[0].key_tu)? {
         if obu.obu_type == ObuType::SequenceHeader {
             let mut full = Vec::new();
             obu.write(&mut full);
@@ -167,26 +198,40 @@ pub fn assemble(
     let sh = crate::seq_header::parse_sequence_header(&seq_payload)?;
     sh.check_supported()
         .context("sequence header enables features this assembler does not support")?;
+    for (i, seg) in segments.iter().enumerate().skip(1) {
+        let mut found = None;
+        for obu in parse_obus(seg.key_tu)? {
+            if obu.obu_type == ObuType::SequenceHeader {
+                found = Some(obu.payload);
+            }
+        }
+        anyhow::ensure!(
+            found.as_deref() == Some(seq_payload.as_slice()),
+            "segment {i} has a different sequence header — encode all images \
+             with identical dimensions/settings"
+        );
+    }
 
     // Streams that don't declare timing get it injected: a constant-rate
     // timing_info matching the output fps. With --decoder-model we go further:
-    // decoder_model_info() is declared AND the two passthrough frames' headers
+    // decoder_model_info() is declared AND the passthrough frames' headers
     // are spliced to carry buffer_removal_time_present_flag=0 (the flag is
     // unconditional once the model is declared; equal_picture_interval keeps
     // temporal_point_info out of every header).
-    let key_tu_owned;
-    let golden_tu_owned;
-    let key_tu2_owned;
-    let golden_tu2_owned;
-    let (sh, key_tu, golden_tu, seq_header_obu) = if params.decoder_model || !sh.timing_info_present
-    {
-        let sh2 = if params.decoder_model {
-            seq_header::with_decoder_model(&sh, params.fps.max(1))
-                .context("decoder model injection")?
+    let rewrite_ctx: Option<(SequenceHeader, Vec<u8>)> =
+        if params.decoder_model || !sh.timing_info_present {
+            let sh2 = if params.decoder_model {
+                seq_header::with_decoder_model(&sh, params.fps.max(1))
+                    .context("decoder model injection")?
+            } else {
+                seq_header::with_timing_info(&sh, params.fps.max(1))
+            };
+            let payload = seq_header::emit_sequence_header(&sh2);
+            Some((sh2, payload))
         } else {
-            seq_header::with_timing_info(&sh, params.fps.max(1))
+            None
         };
-        let payload = seq_header::emit_sequence_header(&sh2);
+    if let Some((_, payload)) = &rewrite_ctx {
         let mut obu_bytes = Vec::new();
         Obu {
             obu_type: ObuType::SequenceHeader,
@@ -194,92 +239,111 @@ pub fn assemble(
             payload: payload.clone(),
         }
         .write(&mut obu_bytes);
-        key_tu_owned = tu_replace_seq_header(key_tu, &payload)?;
-        let mut golden_v = golden_tu.to_vec();
-        if tu_has_seq_header(&golden_v)? {
-            golden_v = tu_replace_seq_header(&golden_v, &payload)?;
+        seq_header_obu = obu_bytes;
+    }
+
+    // --- per-segment rewrite + validation ---
+    struct Prepared {
+        key_tu: TemporalUnit,
+        golden_tu: TemporalUnit,
+        show_tu: TemporalUnit,
+        golden_slot: u8,
+        frames: u64,
+    }
+    let mut prepped: Vec<Prepared> = Vec::new();
+    let mut dpb = uheader::Dpb::default(); // shared across segments, decode order
+    for (i, seg) in segments.iter().enumerate() {
+        let key_tu = match &rewrite_ctx {
+            Some((_, payload)) => tu_replace_seq_header(seg.key_tu, payload)?,
+            None => seg.key_tu.to_vec(),
+        };
+        let mut golden_tu = seg.golden_tu.to_vec();
+        if let Some((_, payload)) = &rewrite_ctx {
+            if tu_has_seq_header(&golden_tu)? {
+                golden_tu = tu_replace_seq_header(&golden_tu, payload)?;
+            }
         }
-        golden_tu_owned = golden_v;
-        if params.decoder_model {
+        let (key_tu, golden_tu) = if params.decoder_model {
             // Scan with the ORIGINAL seq header: the flag is absent from the
             // libaom-emitted headers; we insert it where the model wants it.
-            let mut dpb = uheader::Dpb::default();
-            key_tu2_owned = tu_insert_removal_flag(&key_tu_owned, &sh, &mut dpb)
-                .context("splicing removal flag into keyframe")?;
-            golden_tu2_owned = tu_insert_removal_flag(&golden_tu_owned, &sh, &mut dpb)
-                .context("splicing removal flag into golden frame")?;
             (
-                sh2,
-                key_tu2_owned.as_slice(),
-                golden_tu2_owned.as_slice(),
-                obu_bytes,
+                tu_insert_removal_flag(&key_tu, &sh, &mut dpb).with_context(|| {
+                    format!("splicing removal flag into keyframe (segment {i})")
+                })?,
+                tu_insert_removal_flag(&golden_tu, &sh, &mut dpb)
+                    .with_context(|| format!("splicing removal flag into golden (segment {i})"))?,
             )
         } else {
-            (
-                sh2,
-                key_tu_owned.as_slice(),
-                golden_tu_owned.as_slice(),
-                obu_bytes,
-            )
-        }
-    } else {
-        (sh, key_tu, golden_tu, seq_header_obu)
-    };
+            (key_tu, golden_tu)
+        };
 
-    let key_info = tu_frame_info(key_tu, &sh)?;
-    anyhow::ensure!(
-        key_info.frame_type == Some(KEY_FRAME) && key_info.show_frame,
-        "first TU must contain a shown KEY_FRAME (got {:?})",
-        key_info.frame_type
-    );
+        let sh_eff = match &rewrite_ctx {
+            Some((sh2, _)) => sh2,
+            None => &sh,
+        };
+        let key_info = tu_frame_info(&key_tu, sh_eff)?;
+        anyhow::ensure!(
+            key_info.frame_type == Some(KEY_FRAME) && key_info.show_frame,
+            "segment {i}: first TU must contain a shown KEY_FRAME (got {:?})",
+            key_info.frame_type
+        );
+        let golden_info = tu_frame_info(&golden_tu, sh_eff)?;
+        let gft = golden_info
+            .frame_type
+            .context("golden TU cannot be show_existing")?;
+        anyhow::ensure!(
+            golden_info.show_frame,
+            "segment {i}: golden frame must be shown"
+        );
+        anyhow::ensure!(
+            golden_info.showable_frame && gft != KEY_FRAME,
+            "segment {i}: golden frame is not showable (frame_type={gft})"
+        );
+        let golden_slot = lowest_refreshed_slot(golden_info.refresh_frame_flags)
+            .context("golden frame refreshes no reference slots")?;
 
-    let golden_info = tu_frame_info(golden_tu, &sh)?;
-    let gft = golden_info
-        .frame_type
-        .context("golden TU cannot be show_existing")?;
-    anyhow::ensure!(golden_info.show_frame, "golden frame must be shown");
-    anyhow::ensure!(
-        golden_info.showable_frame && gft != KEY_FRAME,
-        "golden frame is not showable (frame_type={gft})"
-    );
-    let golden_slot = lowest_refreshed_slot(golden_info.refresh_frame_flags)
-        .context("golden frame refreshes no reference slots")?;
-
-    anyhow::ensure!(
-        params.gop_size >= 2,
-        "gop size must be >= 2 (keyframe + golden)"
-    );
-    anyhow::ensure!(
-        params.total_frames >= 2,
-        "need at least 2 output frames (keyframe + golden)"
-    );
+        prepped.push(Prepared {
+            key_tu,
+            golden_tu,
+            show_tu: show_existing_tu(golden_slot),
+            golden_slot,
+            frames: seg.frames,
+        });
+    }
 
     // --- emit ---
-    let show_tu = show_existing_tu(golden_slot);
     let mut tus: Vec<TemporalUnit> = Vec::new();
     let mut key_samples = Vec::new();
-    let mut emitted = 0u64;
-    while emitted < params.total_frames {
-        let remaining = params.total_frames - emitted;
-        let gop = remaining.min(params.gop_size);
-        if gop == 1 {
-            // trailing single frame: just re-show the golden
-            tus.push(show_tu.clone());
-            break;
+    for seg in &prepped {
+        let mut left = seg.frames;
+        let mut golden_emitted = false;
+        while left > 0 {
+            let chunk = left.min(params.gop_size);
+            if chunk == 1 && golden_emitted {
+                // trailing single frame: re-show this segment's golden
+                tus.push(seg.show_tu.clone());
+                break;
+            }
+            key_samples.push(tus.len() as u32 + 1);
+            tus.push(seg.key_tu.clone());
+            if chunk >= 2 {
+                tus.push(seg.golden_tu.clone());
+                golden_emitted = true;
+                for _ in 2..chunk {
+                    tus.push(seg.show_tu.clone());
+                }
+            }
+            left -= chunk;
         }
-        key_samples.push(tus.len() as u32 + 1);
-        tus.push(key_tu.to_vec());
-        tus.push(golden_tu.to_vec());
-        for _ in 2..gop {
-            tus.push(show_tu.clone());
-        }
-        emitted += gop;
     }
     Ok(AssembleOutput {
         tus,
-        golden_slot,
+        golden_slot: prepped[0].golden_slot,
         key_samples,
-        seq_header: sh,
+        seq_header: match rewrite_ctx {
+            Some((sh2, _)) => sh2,
+            None => sh,
+        },
         seq_header_obu,
     })
 }

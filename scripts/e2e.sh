@@ -119,6 +119,41 @@ cargo run --quiet -- make -i "$WORK/still.png" -a "$WORK/audio.m4a" \
 S3=$(stat -c%s "$WORK/mm.mp4")
 [ "$S3" -le 409600 ]
 
+echo "== --playlist: two images, keyframe at the switch"
+ffmpeg -hide_banner -loglevel error -f lavfi \
+    -i "color=c=blue:size=320x180" -frames:v 1 -y "$WORK/still2.png"
+ffmpeg -hide_banner -loglevel error -loop 1 -i "$WORK/still2.png" \
+    -vf format=yuv420p -c:v libaom-av1 -crf 32 -b:v 0 -cpu-used 8 \
+    -r 30 -frames:v 4 -y "$WORK/src2.ivf"
+printf '%s 5\n%s\n' "$WORK/src.ivf" "$WORK/src2.ivf" > "$WORK/list.txt"
+cargo run --quiet -- assemble --playlist "$WORK/list.txt" -o "$WORK/pl.mp4" \
+    --duration 12 --fps 30 --gop 300 --audio "$WORK/audio.aac"
+# 360 frames total; keyframes at t=0 and the t=5s switch
+DECODED=$(ffmpeg -hide_banner -i "$WORK/pl.mp4" -map 0:v:0 -f null - \
+    2>&1 | grep -oE 'frame= *[0-9]+' | tail -1 | grep -oE '[0-9]+')
+echo "decoded frames: $DECODED (expected 360)"
+[ "$DECODED" = "360" ]
+ffprobe -v error -select_streams v -show_entries packet=pts_time,flags \
+    -of csv=p=0 "$WORK/pl.mp4" | grep 'K_' > "$WORK/keys.txt"
+grep -q '^5\.0*0*,K_' "$WORK/keys.txt"
+[ "$(wc -l < "$WORK/keys.txt")" = "2" ]
+# pixels actually change: segment hashes must differ, and the second
+# segment's hash must equal a pure-src2 assembly's hash
+cargo run --quiet -- assemble -i "$WORK/src2.ivf" -o "$WORK/b.ivf" \
+    --frames 4 --gop 4
+ffmpeg -hide_banner -loglevel error -c:v libdav1d -i "$WORK/pl.mp4" \
+    -f framemd5 "$WORK/pl.md5"
+ffmpeg -hide_banner -loglevel error -c:v libdav1d -i "$WORK/b.ivf" \
+    -f framemd5 "$WORK/b.md5"
+B_HASH=$(awk '$1=="0,"{print $6; exit}' "$WORK/b.md5")
+awk -v b="$B_HASH" 'BEGIN{n=0} $1=="0," {n++; if (n==1) h1=$6; if (n==200 && $6!=b) exit 1} END{if (h1==b) exit 1}' "$WORK/pl.md5"
+# seek mid-playlist lands at the 5s keyframe and shows image 2
+ffmpeg -hide_banner -loglevel error -ss 6.5 -c:v libdav1d -i "$WORK/pl.mp4" \
+    -f framemd5 "$WORK/ss.md5"
+SS_HASH=$(awk '$1=="0,"{print $6; exit}' "$WORK/ss.md5")
+[ "$SS_HASH" = "$B_HASH" ]
+echo "playlist OK: switch at 5s keyframe, pixels verified"
+
 echo "== determinism: two runs must be byte-identical"
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.ivf" --frames 300 --gop 300
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.ivf" --frames 300 --gop 300

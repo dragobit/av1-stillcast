@@ -46,8 +46,7 @@ Status:
   fits (seek granularity degrades, warns); `make` walks a crf ladder
   (requested → 40/48/56/63) re-encoding until it fits. Both measure
   the real output bytes, not the model.
-- Remaining: a CRF column in the plan sweep, `--explain` output,
-  multi-image playlists.
+- Remaining: a CRF column in the plan sweep, `--explain` output.
 
 No extra dependencies; the model needs only `kf_size` (measured) and
 constants already known (~6 B/TU + container overhead ~4 B/sample).
