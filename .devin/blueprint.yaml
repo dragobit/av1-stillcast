@@ -1,10 +1,12 @@
 # https://docs.devin.ai/onboard-devin/environment-yaml
 initialize: |
   # Rust toolchain + ffmpeg (e2e encode/decode verification) + playwright
-  # (browser_seek_test.py CDP client; connects to the running Chrome)
+  # + player binaries (compat_players.sh) + playwright firefox build
+  # (BROWSER=firefox headless seek test)
   command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-  sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+  sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg mpv vlc-bin
   pip3 install playwright
+  python3 -m playwright install firefox
 maintenance: |
   cargo fetch
 knowledge:
