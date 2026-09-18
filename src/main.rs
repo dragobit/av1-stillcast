@@ -36,6 +36,9 @@ enum Cmd {
         /// GOP size in frames: distance between keyframes = seek granularity.
         #[arg(long, default_value_t = 300)]
         gop: u64,
+        /// Optional ADTS (.aac) audio to mux into mp4 output.
+        #[arg(long)]
+        audio: Option<PathBuf>,
     },
     /// Inspect IVF input and report key/golden TUs and the golden slot.
     Info {
@@ -54,6 +57,7 @@ fn main() -> Result<()> {
             duration,
             frames,
             gop,
+            audio,
         } => {
             let data =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
@@ -80,16 +84,64 @@ fn main() -> Result<()> {
                 total_frames: total,
                 gop_size: gop,
             };
-            let (tus, slot) = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
-            let out_ivf = stillcast::assemble::to_ivf(&ivf, tus, fps);
-            std::fs::write(&output, stillcast::ivf::write(&out_ivf))
+            let out = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
+            let n_samples = out.tus.len();
+
+            let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
+            if audio.is_some() && !is_mp4 {
+                anyhow::bail!("--audio requires mp4 output (-o out.mp4)");
+            }
+
+            let bytes = if is_mp4 {
+                let vtrack = stillcast::mp4::VideoTrack {
+                    samples: out.tus.into_iter().map(stillcast::mp4::Sample).collect(),
+                    sync_samples: out.key_samples,
+                    width: ivf.width,
+                    height: ivf.height,
+                    timescale: eff_fps,
+                    sample_delta: 1,
+                    av1c: stillcast::mp4::build_av1c(&out.seq_header, &out.seq_header_obu),
+                };
+                let atrack = match audio {
+                    Some(path) => {
+                        let data = std::fs::read(&path)
+                            .with_context(|| format!("reading {}", path.display()))?;
+                        let adts = stillcast::adts::parse(&data)
+                            .with_context(|| format!("parsing {}", path.display()))?;
+                        let total_bits: u64 =
+                            adts.frames.iter().map(|f| (f.len() + 7) as u64 * 8).sum();
+                        let dur_secs =
+                            (adts.frames.len() as u64 * 1024) as f64 / f64::from(adts.sample_rate);
+                        let avg = (total_bits as f64 / dur_secs.max(1e-6)) as u32;
+                        Some(stillcast::mp4::AudioTrack {
+                            samples: adts
+                                .frames
+                                .into_iter()
+                                .map(stillcast::mp4::Sample)
+                                .collect(),
+                            audio_specific_config: adts.audio_specific_config.to_vec(),
+                            sample_rate: adts.sample_rate,
+                            channels: adts.channels,
+                            sample_delta: 1024,
+                            avg_bitrate: avg,
+                            max_bitrate: avg,
+                        })
+                    }
+                    None => None,
+                };
+                stillcast::mp4::write(&vtrack, atrack.as_ref())?
+            } else {
+                let out_ivf = stillcast::assemble::to_ivf(&ivf, out.tus, fps);
+                stillcast::ivf::write(&out_ivf)
+            };
+            std::fs::write(&output, &bytes)
                 .with_context(|| format!("writing {}", output.display()))?;
             println!(
                 "wrote {}: {} frames, {} B, golden slot {}, gop {}",
                 output.display(),
-                out_ivf.frames.len(),
-                std::fs::metadata(&output)?.len(),
-                slot,
+                n_samples,
+                bytes.len(),
+                out.golden_slot,
                 gop
             );
         }
@@ -105,10 +157,10 @@ fn main() -> Result<()> {
                 gop_size: 2,
             };
             match stillcast::assemble::assemble(&key_tu, &golden_tu, &params) {
-                Ok((_, slot)) => println!(
+                Ok(o) => println!(
                     "input OK: {} frames, golden slot {}",
                     ivf.frames.len(),
-                    slot
+                    o.golden_slot
                 ),
                 Err(e) => println!("input not usable: {e:#}"),
             }
