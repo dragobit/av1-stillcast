@@ -22,9 +22,14 @@ enum Cmd {
     /// Drives ffmpeg for the 2-frame libaom encode and (when needed) the
     /// audio -> ADTS conversion, then assembles. Requires ffmpeg on PATH.
     Make {
-        /// Jacket/thumbnail image (png, jpg, ...).
-        #[arg(short, long)]
-        image: PathBuf,
+        /// Jacket/thumbnail image (png, jpg, ...). Mutually exclusive with
+        /// --playlist.
+        #[arg(short, long, conflicts_with = "playlist")]
+        image: Option<PathBuf>,
+        /// Playlist file: one `image_path [seconds]` per line (# comments,
+        /// last entry may omit duration to fill --duration/audio).
+        #[arg(long)]
+        playlist: Option<PathBuf>,
         /// Audio track: .aac/.adts is used as-is, anything else is
         /// transcoded to AAC via ffmpeg. Ignored for .ivf output.
         #[arg(short, long)]
@@ -65,8 +70,13 @@ enum Cmd {
     /// Assemble a long static-video AV1 bitstream from a 2-frame IVF encode.
     Assemble {
         /// Input IVF: >=2 frames; frame 0 = keyframe, frame 1 = golden (inter).
-        #[arg(short, long)]
-        input: PathBuf,
+        /// Mutually exclusive with --playlist.
+        #[arg(short, long, conflicts_with = "playlist")]
+        input: Option<PathBuf>,
+        /// Playlist file: one `input.ivf [seconds]` per line (# comments,
+        /// last entry may omit duration to fill --duration/--frames).
+        #[arg(long)]
+        playlist: Option<PathBuf>,
         /// Output IVF path.
         #[arg(short, long)]
         output: PathBuf,
@@ -218,44 +228,120 @@ fn parse_size(s: &str) -> Result<u64> {
         * mult as f64) as u64)
 }
 
+/// One line of a playlist file: a source (image for `make`, ivf for
+/// `assemble`) plus an optional duration in seconds.
+struct PlaylistEntry {
+    path: PathBuf,
+    seconds: Option<f64>,
+}
+
+/// Parse `path [seconds]` lines; `#` comments and blanks skipped. Relative
+/// paths resolve against the playlist's directory.
+fn read_playlist(path: &Path) -> Result<Vec<PlaylistEntry>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading playlist {}", path.display()))?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (p, secs) = match line.rsplit_once(char::is_whitespace) {
+            Some((head, tail)) if tail.parse::<f64>().is_ok() => (head.trim(), tail.parse().ok()),
+            _ => (line, None),
+        };
+        let mut pb = PathBuf::from(p.trim_matches('"'));
+        if pb.is_relative() {
+            pb = dir.join(pb);
+        }
+        out.push(PlaylistEntry {
+            path: pb,
+            seconds: secs,
+        });
+    }
+    anyhow::ensure!(!out.is_empty(), "empty playlist {}", path.display());
+    Ok(out)
+}
+
+/// Convert per-segment seconds to frame counts. Every entry needs a
+/// duration except the last, which fills the remainder of `total_secs`
+/// (when given and still needed).
+fn segment_frames(
+    entries: &[PlaylistEntry],
+    total_secs: Option<f64>,
+    fps: u32,
+) -> Result<Vec<u64>> {
+    let mut frames = Vec::with_capacity(entries.len());
+    let mut used = 0.0f64;
+    for (i, e) in entries.iter().enumerate() {
+        match e.seconds {
+            Some(s) => {
+                anyhow::ensure!(s > 0.0, "entry {}: duration must be > 0", i + 1);
+                frames.push((s * f64::from(fps)).round().max(1.0) as u64);
+                used += s;
+            }
+            None if i == entries.len() - 1 => {
+                let total = total_secs
+                    .context("last playlist entry has no duration; pass --duration or --audio")?;
+                let rest = total - used;
+                anyhow::ensure!(
+                    rest > 0.0,
+                    "total {}s is shorter than the sum of earlier segments ({used}s)",
+                    total
+                );
+                frames.push((rest * f64::from(fps)).round().max(1.0) as u64);
+            }
+            None => anyhow::bail!("entry {} needs a duration (only the last may omit)", i + 1),
+        }
+    }
+    Ok(frames)
+}
+
 /// Build the output file bytes in memory (ivf or mp4) without writing.
+/// `donor` supplies geometry/timebase (segment 0's IVF); `pairs` are the
+/// per-segment (key TU, golden TU) pairs; `seg_frames` are segment lengths.
 /// Returns (bytes, n_samples, golden_slot, eff_fps, total_frames).
 #[allow(clippy::too_many_arguments)]
 fn build_output(
-    input: &Path,
+    donor: &stillcast::ivf::IvfFile,
+    pairs: &[(
+        stillcast::assemble::TemporalUnit,
+        stillcast::assemble::TemporalUnit,
+    )],
+    seg_frames: &[u64],
     is_mp4: bool,
     fps: Option<u32>,
-    duration: Option<f64>,
-    frames: Option<u64>,
     gop: u64,
     audio: Option<&Path>,
     decoder_model: bool,
 ) -> Result<(Vec<u8>, usize, u8, u32, u64)> {
-    let data = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
-    let (key_tu, golden_tu) = stillcast::assemble::split_input(&ivf).context("splitting input")?;
-
+    let ivf = donor;
     let eff_fps = fps.unwrap_or_else(|| {
         ivf.timebase_den
             .checked_div(ivf.timebase_num.max(1))
             .unwrap_or(30)
             .max(1)
     });
-    let total = if let Some(f) = frames {
-        f
-    } else if let Some(d) = duration {
-        (d * f64::from(eff_fps)).round() as u64
-    } else {
-        anyhow::bail!("specify --duration or --frames");
-    };
+    let total: u64 = seg_frames.iter().sum();
+    anyhow::ensure!(total >= 2, "need at least 2 output frames");
 
+    let segs: Vec<stillcast::assemble::Segment> = pairs
+        .iter()
+        .zip(seg_frames)
+        .map(|((k, g), &f)| stillcast::assemble::Segment {
+            key_tu: k,
+            golden_tu: g,
+            frames: f,
+        })
+        .collect();
     let params = stillcast::assemble::AssembleParams {
         fps: eff_fps,
         total_frames: total,
         gop_size: gop,
         decoder_model,
     };
-    let out = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
+    let out = stillcast::assemble::assemble_multi(&segs, &params)?;
     let n_samples = out.tus.len();
     let golden_slot = out.golden_slot;
 
@@ -301,7 +387,7 @@ fn build_output(
         };
         stillcast::mp4::write(&vtrack, atrack.as_ref())?
     } else {
-        let out_ivf = stillcast::assemble::to_ivf(&ivf, out.tus, fps);
+        let out_ivf = stillcast::assemble::to_ivf(ivf, out.tus, fps);
         stillcast::ivf::write(&out_ivf)
     };
     Ok((bytes, n_samples, golden_slot, eff_fps, total))
@@ -344,15 +430,45 @@ fn ensure_adts(audio: &Path, work_dir: &Path, bitrate: &str) -> Result<PathBuf> 
     Ok(out)
 }
 
+/// Load every input IVF and extract (key TU, golden TU) pairs.
+/// Returns the geometry-donor IVF (segment 0) plus the pairs.
+fn load_pairs(
+    paths: &[PathBuf],
+) -> Result<(
+    stillcast::ivf::IvfFile,
+    Vec<(
+        stillcast::assemble::TemporalUnit,
+        stillcast::assemble::TemporalUnit,
+    )>,
+)> {
+    let mut donor = None;
+    let mut pairs = Vec::new();
+    for p in paths {
+        let data = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+        let ivf =
+            stillcast::ivf::read(&data).with_context(|| format!("parsing {}", p.display()))?;
+        let pair = stillcast::assemble::split_input(&ivf)
+            .with_context(|| format!("splitting {}", p.display()))?;
+        if donor.is_none() {
+            donor = Some(ivf);
+        }
+        pairs.push(pair);
+    }
+    Ok((donor.context("no inputs")?, pairs))
+}
+
 /// Grow gop geometrically until the produced file fits `max_bytes`.
 /// Returns (bytes, n_samples, golden_slot, chosen gop, fits_budget).
 #[allow(clippy::too_many_arguments)]
 fn fit_gop_for_size(
-    input: &Path,
+    donor: &stillcast::ivf::IvfFile,
+    pairs: &[(
+        stillcast::assemble::TemporalUnit,
+        stillcast::assemble::TemporalUnit,
+    )],
+    seg_frames: &[u64],
     is_mp4: bool,
     fps: Option<u32>,
-    duration: Option<f64>,
-    frames: Option<u64>,
     gop: u64,
     audio: Option<&Path>,
     max_bytes: u64,
@@ -361,11 +477,11 @@ fn fit_gop_for_size(
     let mut g = gop.max(2);
     loop {
         let (bytes, n, slot, _fps, total) = build_output(
-            input,
+            donor,
+            pairs,
+            seg_frames,
             is_mp4,
             fps,
-            duration,
-            frames,
             g,
             audio,
             decoder_model,
@@ -383,6 +499,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Make {
             image,
+            playlist,
             audio,
             output,
             fps,
@@ -395,6 +512,15 @@ fn main() -> Result<()> {
             audio_bitrate,
             keep_work,
         } => {
+            let entries = match (&image, &playlist) {
+                (Some(img), None) => vec![PlaylistEntry {
+                    path: img.clone(),
+                    seconds: duration,
+                }],
+                (None, Some(pl)) => read_playlist(pl)?,
+                _ => anyhow::bail!("need -i <image> or --playlist <file>"),
+            };
+
             let work = if keep_work {
                 output
                     .parent()
@@ -404,7 +530,6 @@ fn main() -> Result<()> {
                 std::env::temp_dir().join(format!("stillcast-{}", std::process::id()))
             };
             std::fs::create_dir_all(&work)?;
-            let src_ivf = work.join("src.ivf");
 
             let is_mp4 = is_mp4_path(&output);
             let aac = match &audio {
@@ -412,14 +537,15 @@ fn main() -> Result<()> {
                 _ => None,
             };
 
-            let duration = match (duration, &audio) {
+            let total_secs = match (duration, &audio) {
                 (Some(d), _) => Some(d),
                 (None, Some(a)) => Some(
                     ffprobe_duration(a)
                         .context("could not probe audio duration; pass --duration")?,
                 ),
-                (None, None) => anyhow::bail!("no --audio: pass --duration or --frames"),
+                (None, None) => None,
             };
+            let seg_frames = segment_frames(&entries, total_secs, fps)?;
             let gop = resolve_gop(gop, target_seek, fps);
 
             // CRF ladder when a size budget is given: first fit wins.
@@ -435,13 +561,19 @@ fn main() -> Result<()> {
             let mut last_err: Option<anyhow::Error> = None;
             let mut chosen: Option<(Vec<u8>, usize, u8, u32)> = None; // bytes,n,slot,crf_used
             for c in &crfs {
-                encode_still(&image, fps, *c, &src_ivf)?;
+                let mut srcs = Vec::with_capacity(entries.len());
+                for (i, e) in entries.iter().enumerate() {
+                    let p = work.join(format!("src{i}.ivf"));
+                    encode_still(&e.path, fps, *c, &p)?;
+                    srcs.push(p);
+                }
+                let (donor, pairs) = load_pairs(&srcs)?;
                 match build_output(
-                    &src_ivf,
+                    &donor,
+                    &pairs,
+                    &seg_frames,
                     is_mp4,
                     Some(fps),
-                    duration,
-                    None,
                     gop,
                     aac.as_deref(),
                     decoder_model,
@@ -481,6 +613,7 @@ fn main() -> Result<()> {
         }
         Cmd::Assemble {
             input,
+            playlist,
             output,
             fps,
             duration,
@@ -491,9 +624,34 @@ fn main() -> Result<()> {
             max_size,
             decoder_model,
         } => {
-            let eff_fps = fps.unwrap_or(30);
+            let entries = match (&input, &playlist) {
+                (Some(i), None) => vec![PlaylistEntry {
+                    path: i.clone(),
+                    seconds: if frames.is_some() { None } else { duration },
+                }],
+                (None, Some(pl)) => read_playlist(pl)?,
+                _ => anyhow::bail!("need -i <ivf> or --playlist <file>"),
+            };
+            let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+            let (donor, pairs) = load_pairs(&paths)?;
+            let eff_fps = fps.unwrap_or_else(|| {
+                donor
+                    .timebase_den
+                    .checked_div(donor.timebase_num.max(1))
+                    .unwrap_or(30)
+                    .max(1)
+            });
             let gop = resolve_gop(gop, target_seek, eff_fps);
             let is_mp4 = is_mp4_path(&output);
+
+            // --frames counts total output; otherwise --duration (or the sum
+            // of per-segment playlist durations) gives the length. A trailing
+            // playlist entry without a duration fills the remainder.
+            let total_secs = match (frames, duration) {
+                (Some(f), _) => Some(f as f64 / f64::from(eff_fps)),
+                (None, d) => d,
+            };
+            let seg_frames = segment_frames(&entries, total_secs, eff_fps)?;
 
             // Non-ADTS audio gets transcoded via ffmpeg into a temp dir.
             let work = std::env::temp_dir().join(format!("stillcast-{}", std::process::id()));
@@ -508,11 +666,11 @@ fn main() -> Result<()> {
             match max_size.map(|s| parse_size(&s)).transpose()? {
                 Some(budget) => {
                     let (bytes, n, slot, g, fits) = fit_gop_for_size(
-                        &input,
+                        &donor,
+                        &pairs,
+                        &seg_frames,
                         is_mp4,
                         fps,
-                        duration,
-                        frames,
                         gop,
                         aac.as_deref(),
                         budget,
@@ -532,11 +690,11 @@ fn main() -> Result<()> {
                 }
                 None => {
                     let (bytes, n, slot, _, _) = build_output(
-                        &input,
+                        &donor,
+                        &pairs,
+                        &seg_frames,
                         is_mp4,
                         fps,
-                        duration,
-                        frames,
                         gop,
                         aac.as_deref(),
                         decoder_model,
