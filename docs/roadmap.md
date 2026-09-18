@@ -52,7 +52,23 @@ Status:
 No extra dependencies; the model needs only `kf_size` (measured) and
 constants already known (~6 B/TU + container overhead ~4 B/sample).
 
-## 3. ffmpeg bitstream filter (long-term, additive path)
+## 3. Decoder model (`decoder_model_info` / `temporal_point_info`), phased
+
+Goal: emit strict conformance metadata so HRD-checking decoders and some
+hw/broadcast pipelines accept our streams.
+
+- ✅ Phase A: the sequence header parser now stores every field and can
+  re-emit the header bit-exactly; `assemble`/`make` inject a constant-rate
+  `timing_info` (fps + `equal_picture_interval`) when the source lacks one.
+  `equal_picture_interval=1` also means `temporal_point_info` is never
+  required in frame headers.
+- Remaining Phase B: `decoder_model_info` + per-frame
+  `buffer_removal_time_present_flag` requires rewriting the two libaom
+  frame headers, which needs a full uncompressed-header parser/re-packer —
+  the heavy step, kept for a later PR (round-trip byte-identity is the
+  validation strategy).
+
+## 4. ffmpeg bitstream filter (long-term, additive path)
 
 See `docs/design.md` §“Path to ffmpeg”. Key point for positioning: the
 CLI/`make` flow (image + audio → video) remains the product; the bsf makes
