@@ -38,14 +38,12 @@ seek_error  <  gop frames        compat risk ∝ stream oddity
 where `kf_size` comes from one probe encode (libaom is deterministic at
 fixed CRF, so a 2-frame probe predicts exactly).
 
-Planned behavior:
-- `stillcast plan -i src.ivf` — sweep gop ∈ {150,300,600,1200,3600,∞} ×
-  crf ∈ {26,32,40}, print a Pareto table: video bytes, effective kbps,
-  worst-case seek latency. Cheap to compute (expansion is ~ms).
-- `stillcast make --target-seek 5s` — solve for gop directly
-  (`gop = target × fps`), choose crf by a size budget if given
-  (`--max-size`).
-- `--explain` — print the chosen (gop, crf) and the projected numbers.
+Status:
+- ✅ `stillcast plan -i src.ivf --duration 3600` — gop sweep table:
+  stream bytes, kbps, worst-case seek latency.
+- ✅ `--target-seek N` on `make`/`assemble` — picks `gop = N×fps`.
+- Remaining: `--max-size` (CRF solving needs a re-encode loop), a CRF
+  column in the sweep, `--explain` output.
 
 No extra dependencies; the model needs only `kf_size` (measured) and
 constants already known (~6 B/TU + container overhead ~4 B/sample).

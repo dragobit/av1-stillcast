@@ -58,6 +58,14 @@ DECODED=$(ffmpeg -hide_banner -i "$WORK/made.mp4" -map 0:v:0 -f null - \
 echo "decoded frames: $DECODED (expected ~900)"
 [ "$DECODED" -ge 890 ]
 
+echo "== stillcast plan + --target-seek"
+cargo run --quiet -- plan -i "$WORK/src.ivf" --duration 60 | tee "$WORK/plan.txt"
+grep -q 'repeat TU' "$WORK/plan.txt"
+cargo run --quiet -- make -i "$WORK/still.png" -a "$WORK/audio.aac" \
+    -o "$WORK/ts.mp4" --target-seek 5 --duration 10
+ffprobe -v error -show_entries stream=nb_frames -select_streams v \
+    -of csv=p=0 "$WORK/ts.mp4" | grep -q '^300$'
+
 echo "== determinism: two runs must be byte-identical"
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.ivf" --frames 300 --gop 300
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.ivf" --frames 300 --gop 300

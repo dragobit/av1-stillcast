@@ -39,8 +39,11 @@ enum Cmd {
         #[arg(long)]
         duration: Option<f64>,
         /// GOP size in frames: distance between keyframes = seek granularity.
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 300, conflicts_with = "target_seek")]
         gop: u64,
+        /// Alternative to --gop: pick gop = target_seek_seconds * fps.
+        #[arg(long)]
+        target_seek: Option<f64>,
         /// libaom constant-quality level for the real frames.
         #[arg(long, default_value_t = 32)]
         crf: u32,
@@ -69,17 +72,39 @@ enum Cmd {
         #[arg(long)]
         frames: Option<u64>,
         /// GOP size in frames: distance between keyframes = seek granularity.
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 300, conflicts_with = "target_seek")]
         gop: u64,
+        /// Alternative to --gop: pick gop = target_seek_seconds * fps.
+        #[arg(long)]
+        target_seek: Option<f64>,
         /// Optional ADTS (.aac) audio to mux into mp4 output.
         #[arg(long)]
         audio: Option<PathBuf>,
+    },
+    /// Size/seek frontier: project stream size and worst seek latency per gop.
+    Plan {
+        /// Input IVF (same contract as assemble).
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Output frame rate (overrides input timebase).
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Duration to project over, in seconds.
+        #[arg(long, default_value_t = 3600.0)]
+        duration: f64,
     },
     /// Inspect IVF input and report key/golden TUs and the golden slot.
     Info {
         #[arg(short, long)]
         input: PathBuf,
     },
+}
+
+fn resolve_gop(gop: u64, target_seek: Option<f64>, fps: u32) -> u64 {
+    match target_seek {
+        Some(s) => (s * f64::from(fps)).round().max(2.0) as u64,
+        None => gop,
+    }
 }
 
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
@@ -116,6 +141,16 @@ fn is_adts(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("aac") | Some("adts")
     )
+}
+
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1 << 20 {
+        format!("{:.1} MB", b as f64 / (1 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.1} KB", b as f64 / (1 << 10) as f64)
+    } else {
+        format!("{b} B")
+    }
 }
 
 fn assemble_to_file(
@@ -221,6 +256,7 @@ fn main() -> Result<()> {
             fps,
             duration,
             gop,
+            target_seek,
             crf,
             audio_bitrate,
             keep_work,
@@ -286,6 +322,7 @@ fn main() -> Result<()> {
                 ),
                 (None, None) => anyhow::bail!("no --audio: pass --duration or --frames"),
             };
+            let gop = resolve_gop(gop, target_seek, fps);
 
             assemble_to_file(
                 &src_ivf,
@@ -308,17 +345,77 @@ fn main() -> Result<()> {
             duration,
             frames,
             gop,
+            target_seek,
             audio,
         } => {
+            let eff_fps = fps.unwrap_or(30);
             assemble_to_file(
                 &input,
                 &output,
                 fps,
                 duration,
                 frames,
-                gop,
+                resolve_gop(gop, target_seek, eff_fps),
                 audio.as_deref(),
             )?;
+        }
+        Cmd::Plan {
+            input,
+            fps,
+            duration,
+        } => {
+            let data =
+                std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
+            let (key_tu, golden_tu) =
+                stillcast::assemble::split_input(&ivf).context("splitting input")?;
+            let eff_fps = fps.unwrap_or_else(|| {
+                ivf.timebase_den
+                    .checked_div(ivf.timebase_num.max(1))
+                    .unwrap_or(30)
+                    .max(1)
+            });
+            // Measure one show_existing TU to get the per-frame repeat cost.
+            let probe = stillcast::assemble::assemble(
+                &key_tu,
+                &golden_tu,
+                &stillcast::assemble::AssembleParams {
+                    fps: eff_fps,
+                    total_frames: 300,
+                    gop_size: 300,
+                },
+            )?;
+            let se_size = probe.tus.get(2).map(|t| t.len()).unwrap_or(6) as u64;
+            let kf_size = key_tu.len() as u64;
+            let g_size = golden_tu.len() as u64;
+            let total = (duration * f64::from(eff_fps)).round() as u64;
+
+            println!("input: key TU {kf_size} B, golden TU {g_size} B, repeat TU {se_size} B");
+            println!("projection: {duration}s @ {eff_fps}fps = {total} frames");
+            println!(
+                "{:>8} {:>10} {:>10} {:>12}",
+                "gop", "video", "kbps", "worst seek"
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            for g in [60u64, 150, 300, 600, 1200, 3600, total] {
+                let g = g.clamp(2, total);
+                if !seen.insert(g) {
+                    continue;
+                }
+                let n_gops = total.div_ceil(g);
+                let bytes =
+                    n_gops * (kf_size + g_size) + total.saturating_sub(2 * n_gops) * se_size;
+                let kbps = bytes as f64 * 8.0 / duration / 1000.0;
+                println!(
+                    "{:>8} {:>10} {:>10.1} {:>11.1}s",
+                    g,
+                    fmt_bytes(bytes),
+                    kbps,
+                    g as f64 / f64::from(eff_fps)
+                );
+            }
+            println!("(elementary stream; container adds ~12 B/frame ivf, ~4 B/frame mp4)");
+            println!("(--target-seek N picks gop = N*fps directly in make/assemble)");
         }
         Cmd::Info { input } => {
             let data =

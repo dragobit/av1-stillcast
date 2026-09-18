@@ -48,6 +48,11 @@ PATH for the real-frame encode and audio handling):
 # jacket art + podcast audio -> 1-hour YouTube-ready mp4.
 stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --gop 300
 # duration defaults to the audio duration; --fps/--crf/--audio-bitrate tunable
+
+# size/seek frontier for this input before choosing:
+stillcast plan -i src.ivf --duration 3600
+# ...or just state the seek requirement and let it pick gop:
+stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --target-seek 5
 ```
 
 The explicit pipeline — drive libaom yourself, then assemble — stays
@@ -97,10 +102,11 @@ cargo test            # unit tests
       transcodes via ffmpeg)
 - [ ] WebM/MKV output
 - [ ] Decoder-model / `temporal_point_info` support
+- [x] Limit-tracer v1: `stillcast plan` prints the size/seek table,
+      `--target-seek N` picks `gop = N*fps` (see `docs/roadmap.md`)
 - [ ] Compatibility matrix: hw decoders, browsers, mobile players
       (plan: `docs/roadmap.md`)
-- [ ] "Limit-tracer" mode: pick gop/quality automatically from size or
-      seek-granularity targets (plan: `docs/roadmap.md`)
+- [ ] Limit-tracer v2: `--max-size` CRF solving, multi-image playlists
 - [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
       (`av1_stillcast` bsf) — an *additional* path, not a replacement for
       the CLI flow above
