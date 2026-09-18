@@ -10,6 +10,7 @@ seek). ✅ verified, ⬜ untested, ⚠️ partial/known issue.
 
 | decoder / player | play | mid-seek | sync | notes |
 |---|---|---|---|---|
+| aomdec (AV1 reference decoder) | ✅ | — | — | aom git tip, decode-only build: 913/913 frames on `demo.mp4`'s stream, 360/360 on a 2-image playlist stream incl. `--decoder-model` variant; zero errors |
 | libdav1d (sw decoder) | ✅ | ✅ | ✅ | e2e-verified, frame-exact |
 | ffmpeg demux+seek path | ✅ | ✅ | ✅ | `-ss` lands on prior stss keyframe; `-copyts` output starts at exact target pts |
 | ffmpeg `av1` native decoder | ⬜ | ⬜ | ⬜ | untested (fails in our env on all av1 files) |

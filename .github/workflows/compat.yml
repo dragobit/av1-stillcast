@@ -27,6 +27,29 @@ jobs:
       - name: seek test (mid-GOP seeks + playthrough)
         run: BROWSER=firefox python3 scripts/browser_seek_test.py examples/demo.mp4
 
+  reference-decoder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build aomdec (AV1 reference decoder, decode-only)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq cmake nasm
+          git clone --depth 1 https://aomedia.googlesource.com/aom /tmp/aom
+          cmake -S /tmp/aom -B /tmp/aom/build -DCMAKE_BUILD_TYPE=Release \
+            -DCONFIG_AV1_ENCODER=0 -DENABLE_TESTS=0 -DENABLE_DOCS=0 \
+            -DENABLE_EXAMPLES=0 -DENABLE_TOOLS=0
+          cmake --build /tmp/aom/build --target aomdec -j"$(nproc)"
+      - name: decode-verify demo.mp4's stream via aomdec
+        run: |
+          # demux the elementary stream, then the strictest decoder must
+          # accept every frame
+          ffmpeg -hide_banner -loglevel error -i examples/demo.mp4 \
+            -map 0:v:0 -c:v copy -f ivf /tmp/demo.ivf
+          /tmp/aom/build/aomdec --summary --rawvideo -o /dev/null /tmp/demo.ivf \
+            2>&1 | tee /tmp/aomdec.out
+          grep -E '[0-9]+ decoded frames/[0-9]+ showed' /tmp/aomdec.out
+          ! grep -qiE 'error|corrupt|invalid' /tmp/aomdec.out
+
   android:
     runs-on: ubuntu-latest
     steps:
