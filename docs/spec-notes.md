@@ -105,6 +105,11 @@ payload) ≈ **6 bytes**.
 - Seeks land on keyframes: worst-case latency = one GOP length of cheap
   show_existing TUs — fast, but a hard boundary. `--gop` trades seek
   granularity against size.
-- Not yet supported: decoder model (`temporal_point_info`),
-  `frame_id_numbers_present`, film grain (grain params are re-loaded per
-  shown frame and would need emitting per TU).
+- Decoder model: `--decoder-model` emits `decoder_model_info` in the
+  sequence header and splices `buffer_removal_time_present_flag=0` into
+  the two real frame headers. `equal_picture_interval=1` keeps
+  `temporal_point_info` unnecessary everywhere, so the flag is always 0
+  and no removal times are written. Input streams that already declare a
+  decoder model with unequal picture intervals are still rejected.
+- Still not supported: `frame_id_numbers_present`, film grain (grain
+  params are re-loaded per shown frame and would need emitting per TU).

@@ -108,10 +108,15 @@ pub fn parse_frame_header_info(payload: &[u8], sh: &SequenceHeader) -> Result<Fr
 
     if sh.decoder_model_info_present {
         // buffer_removal_time_present_flag, then removal times per operating
-        // point. Rejected upstream by check_supported for the unequal-interval
-        // case; even with equal_picture_interval removal_time fields would
-        // still need parsing, so bail conservatively.
-        bail!("decoder_model_info_present streams are not supported");
+        // point (opPtIdc==0 → always in-layer for our single-op streams).
+        if r.f(1)? == 1 {
+            let n = usize::from(sh.buffer_removal_time_length_minus_1) + 1;
+            for op in &sh.operating_points {
+                if op.decoder_model_present {
+                    r.f(n)?;
+                }
+            }
+        }
     }
 
     let refresh_frame_flags =

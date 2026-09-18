@@ -45,12 +45,13 @@ Input IVF must contain ≥2 packets produced by a conformant encoder for the
 same static picture: packet 0 = seq header + shown keyframe; packet 1 = the
 golden (a shown inter frame is what libaom emits for identical content).
 Rejected up front: reduced still-picture headers, frame id numbers,
-decoder-model timing info, film grain.
+unequal-interval decoder-model timing, film grain.
 
 ## MP4 output
 
-Layout is `ftyp | mdat | moov` (mdat first, so chunk offsets are known in
-one pass). The video track carries an `av01` sample entry whose `av1C` box
+Layout is `ftyp | moov | mdat` (faststart: moov first, via a two-pass
+build — the stco count doesn't depend on moov size, so offsets patch
+cleanly). The video track carries an `av01` sample entry whose `av1C` box
 is derived from the parsed sequence header; keyframes land in `stss`, so
 seek granularity = gop. The audio track takes an ADTS file, strips the
 7-byte headers into `mp4a` samples, and writes `esds` with the

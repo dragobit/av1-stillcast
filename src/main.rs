@@ -51,6 +51,10 @@ enum Cmd {
         /// (keeps gop/seek granularity).
         #[arg(long)]
         max_size: Option<String>,
+        /// Declare decoder_model_info() in the AV1 sequence header
+        /// (rewrites the real frames' headers; costs ~1 bit/frame).
+        #[arg(long)]
+        decoder_model: bool,
         /// AAC bitrate when transcoding non-ADTS audio.
         #[arg(long, default_value = "96k")]
         audio_bitrate: String,
@@ -89,6 +93,10 @@ enum Cmd {
         /// fits (degrades seek granularity; video only gets smaller).
         #[arg(long)]
         max_size: Option<String>,
+        /// Declare decoder_model_info() in the AV1 sequence header
+        /// (rewrites the real frames' headers; costs ~1 bit/frame).
+        #[arg(long)]
+        decoder_model: bool,
     },
     /// Size/seek frontier: project stream size and worst seek latency per gop.
     Plan {
@@ -212,6 +220,7 @@ fn parse_size(s: &str) -> Result<u64> {
 
 /// Build the output file bytes in memory (ivf or mp4) without writing.
 /// Returns (bytes, n_samples, golden_slot, eff_fps, total_frames).
+#[allow(clippy::too_many_arguments)]
 fn build_output(
     input: &Path,
     is_mp4: bool,
@@ -220,6 +229,7 @@ fn build_output(
     frames: Option<u64>,
     gop: u64,
     audio: Option<&Path>,
+    decoder_model: bool,
 ) -> Result<(Vec<u8>, usize, u8, u32, u64)> {
     let data = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
@@ -243,6 +253,7 @@ fn build_output(
         fps: eff_fps,
         total_frames: total,
         gop_size: gop,
+        decoder_model,
     };
     let out = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
     let n_samples = out.tus.len();
@@ -345,11 +356,20 @@ fn fit_gop_for_size(
     gop: u64,
     audio: Option<&Path>,
     max_bytes: u64,
+    decoder_model: bool,
 ) -> Result<(Vec<u8>, usize, u8, u64, bool)> {
     let mut g = gop.max(2);
     loop {
-        let (bytes, n, slot, _fps, total) =
-            build_output(input, is_mp4, fps, duration, frames, g, audio)?;
+        let (bytes, n, slot, _fps, total) = build_output(
+            input,
+            is_mp4,
+            fps,
+            duration,
+            frames,
+            g,
+            audio,
+            decoder_model,
+        )?;
         let fits = bytes.len() as u64 <= max_bytes;
         if fits || g >= total {
             return Ok((bytes, n, slot, g, fits));
@@ -371,6 +391,7 @@ fn main() -> Result<()> {
             target_seek,
             crf,
             max_size,
+            decoder_model,
             audio_bitrate,
             keep_work,
         } => {
@@ -423,6 +444,7 @@ fn main() -> Result<()> {
                     None,
                     gop,
                     aac.as_deref(),
+                    decoder_model,
                 ) {
                     Ok((bytes, n, slot, _, _)) => {
                         let fits = budget.map(|b| bytes.len() as u64 <= b).unwrap_or(true);
@@ -467,6 +489,7 @@ fn main() -> Result<()> {
             target_seek,
             audio,
             max_size,
+            decoder_model,
         } => {
             let eff_fps = fps.unwrap_or(30);
             let gop = resolve_gop(gop, target_seek, eff_fps);
@@ -493,6 +516,7 @@ fn main() -> Result<()> {
                         gop,
                         aac.as_deref(),
                         budget,
+                        decoder_model,
                     )?;
                     if !fits {
                         eprintln!(
@@ -507,8 +531,16 @@ fn main() -> Result<()> {
                     write_output(&output, &bytes, n, slot, g)?;
                 }
                 None => {
-                    let (bytes, n, slot, _, _) =
-                        build_output(&input, is_mp4, fps, duration, frames, gop, aac.as_deref())?;
+                    let (bytes, n, slot, _, _) = build_output(
+                        &input,
+                        is_mp4,
+                        fps,
+                        duration,
+                        frames,
+                        gop,
+                        aac.as_deref(),
+                        decoder_model,
+                    )?;
                     write_output(&output, &bytes, n, slot, gop)?;
                 }
             }
@@ -538,6 +570,7 @@ fn main() -> Result<()> {
                     fps: eff_fps,
                     total_frames: 300,
                     gop_size: 300,
+                    decoder_model: false,
                 },
             )?;
             let se_size = probe.tus.get(2).map(|t| t.len()).unwrap_or(6) as u64;
@@ -582,6 +615,7 @@ fn main() -> Result<()> {
                 fps: 30,
                 total_frames: 2,
                 gop_size: 2,
+                decoder_model: false,
             };
             match stillcast::assemble::assemble(&key_tu, &golden_tu, &params) {
                 Ok(o) => println!(

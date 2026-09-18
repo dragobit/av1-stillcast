@@ -62,11 +62,18 @@ hw/broadcast pipelines accept our streams.
   `timing_info` (fps + `equal_picture_interval`) when the source lacks one.
   `equal_picture_interval=1` also means `temporal_point_info` is never
   required in frame headers.
-- Remaining Phase B: `decoder_model_info` + per-frame
-  `buffer_removal_time_present_flag` requires rewriting the two libaom
-  frame headers, which needs a full uncompressed-header parser/re-packer —
-  the heavy step, kept for a later PR (round-trip byte-identity is the
-  validation strategy).
+- ✅ Phase B (`--decoder-model`): a full uncompressed-header walker
+  (`uheader.rs`) computes each real frame's header bit length, then
+  `splice_header_bits` inserts `buffer_removal_time_present_flag=0` after
+  `primary_ref_frame` and re-emits `byte_alignment` (zeros only — not
+  `trailing_bits`). The sequence header is rewritten with
+  `decoder_model_info` (90000-tick delays, removal/presentation field
+  widths) and copied into both KF and golden TUs. Validation: bit-exact
+  rescan of the spliced header, libdav1d full decode pixel-identical to
+  the non-DM stream, and ffmpeg's strict cbs parser accepts every OBU
+  (e2e asserts no `zero_bit`/`Failed to read` warnings).
+  `equal_picture_interval=1` still means `temporal_point_info` is never
+  required in frame headers.
 
 ## 4. ffmpeg bitstream filter (long-term, additive path)
 

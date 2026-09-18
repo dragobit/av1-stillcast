@@ -109,7 +109,9 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
 - [x] Audio input: any ffmpeg-readable format → AAC (both `make` and
       `assemble --audio`)
 - [ ] WebM/MKV output
-- [ ] Decoder-model / `temporal_point_info` support
+- [x] Decoder-model: `--decoder-model` emits `decoder_model_info` +
+      `buffer_removal_time_present_flag` (opt-in; `equal_picture_interval`
+      keeps `temporal_point_info` unnecessary)
 - [x] Limit-tracer: `stillcast plan` size/seek table, `--target-seek N`
       (gop = N×fps), `--max-size` (assemble: gop growth, make: crf ladder)
 - [ ] Compatibility matrix: hw decoders, browsers, mobile players

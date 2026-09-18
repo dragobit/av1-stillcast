@@ -13,6 +13,7 @@ use crate::frame_header::{self, KEY_FRAME};
 use crate::ivf::IvfFile;
 use crate::obu::{parse_obus, Obu, ObuType};
 use crate::seq_header::{self, SequenceHeader};
+use crate::uheader;
 
 /// Parameters controlling the assembled stream.
 pub struct AssembleParams {
@@ -22,6 +23,10 @@ pub struct AssembleParams {
     pub total_frames: u64,
     /// Frames per GOP (distance between keyframes). Controls seek granularity.
     pub gop_size: u64,
+    /// Emit decoder_model_info() in the sequence header. Requires rewriting
+    /// the real frames' headers (buffer_removal_time_present_flag is
+    /// unconditional when the model is declared); we always write it as 0.
+    pub decoder_model: bool,
 }
 
 /// A temporal unit (the OBU payload sequence of one IVF packet).
@@ -45,6 +50,39 @@ fn tu_has_seq_header(tu: &[u8]) -> Result<bool> {
     Ok(parse_obus(tu)?
         .iter()
         .any(|o| o.obu_type == ObuType::SequenceHeader))
+}
+
+/// Rewrite `tu`: splice `buffer_removal_time_present_flag=0` into each
+/// Frame/FrameHeader OBU payload. `orig_sh` is the sequence header WITHOUT
+/// decoder_model_info (matching the bytes being scanned); `dpb` carries
+/// ref-slot state across the TUs in decode order.
+fn tu_insert_removal_flag(
+    tu: &[u8],
+    orig_sh: &SequenceHeader,
+    dpb: &mut uheader::Dpb,
+) -> Result<TemporalUnit> {
+    let mut out = Vec::with_capacity(tu.len() + 4);
+    for obu in parse_obus(tu)? {
+        match obu.obu_type {
+            ObuType::Frame | ObuType::FrameHeader => {
+                let scan = uheader::scan_uncompressed_header(&obu.payload, orig_sh, dpb)?;
+                let payload = uheader::splice_header_bits(
+                    &obu.payload,
+                    scan.removal_insert_pos,
+                    scan.end_pos,
+                    &[(1, 0)],
+                )?;
+                Obu {
+                    obu_type: obu.obu_type,
+                    extension: obu.extension,
+                    payload,
+                }
+                .write(&mut out);
+            }
+            _ => obu.write(&mut out),
+        }
+    }
+    Ok(out)
 }
 
 /// Rewrite `tu`, replacing the sequence header OBU payload with `new_payload`
@@ -131,13 +169,23 @@ pub fn assemble(
         .context("sequence header enables features this assembler does not support")?;
 
     // Streams that don't declare timing get it injected: a constant-rate
-    // timing_info matching the output fps. This leaves frame headers
-    // untouched (no decoder model bits) while making the bitstream itself
-    // declare its rate — and lays the equal_picture_interval groundwork for
-    // decoder_model_info later.
+    // timing_info matching the output fps. With --decoder-model we go further:
+    // decoder_model_info() is declared AND the two passthrough frames' headers
+    // are spliced to carry buffer_removal_time_present_flag=0 (the flag is
+    // unconditional once the model is declared; equal_picture_interval keeps
+    // temporal_point_info out of every header).
     let key_tu_owned;
-    let (sh, key_tu, seq_header_obu) = if !sh.timing_info_present {
-        let sh2 = seq_header::with_timing_info(&sh, params.fps.max(1));
+    let golden_tu_owned;
+    let key_tu2_owned;
+    let golden_tu2_owned;
+    let (sh, key_tu, golden_tu, seq_header_obu) = if params.decoder_model || !sh.timing_info_present
+    {
+        let sh2 = if params.decoder_model {
+            seq_header::with_decoder_model(&sh, params.fps.max(1))
+                .context("decoder model injection")?
+        } else {
+            seq_header::with_timing_info(&sh, params.fps.max(1))
+        };
         let payload = seq_header::emit_sequence_header(&sh2);
         let mut obu_bytes = Vec::new();
         Obu {
@@ -147,9 +195,35 @@ pub fn assemble(
         }
         .write(&mut obu_bytes);
         key_tu_owned = tu_replace_seq_header(key_tu, &payload)?;
-        (sh2, key_tu_owned.as_slice(), obu_bytes)
+        let mut golden_v = golden_tu.to_vec();
+        if tu_has_seq_header(&golden_v)? {
+            golden_v = tu_replace_seq_header(&golden_v, &payload)?;
+        }
+        golden_tu_owned = golden_v;
+        if params.decoder_model {
+            // Scan with the ORIGINAL seq header: the flag is absent from the
+            // libaom-emitted headers; we insert it where the model wants it.
+            let mut dpb = uheader::Dpb::default();
+            key_tu2_owned = tu_insert_removal_flag(&key_tu_owned, &sh, &mut dpb)
+                .context("splicing removal flag into keyframe")?;
+            golden_tu2_owned = tu_insert_removal_flag(&golden_tu_owned, &sh, &mut dpb)
+                .context("splicing removal flag into golden frame")?;
+            (
+                sh2,
+                key_tu2_owned.as_slice(),
+                golden_tu2_owned.as_slice(),
+                obu_bytes,
+            )
+        } else {
+            (
+                sh2,
+                key_tu_owned.as_slice(),
+                golden_tu_owned.as_slice(),
+                obu_bytes,
+            )
+        }
     } else {
-        (sh, key_tu, seq_header_obu)
+        (sh, key_tu, golden_tu, seq_header_obu)
     };
 
     let key_info = tu_frame_info(key_tu, &sh)?;
