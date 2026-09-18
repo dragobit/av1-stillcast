@@ -6,6 +6,30 @@ This documents why that stream is legal and which spec constraints had to be
 satisfied. Section numbers refer to the AV1 spec (v1.0.0-errata1 / current
 editor's draft; same numbering).
 
+## Terminology: what AV1 separates that other codecs conflate
+
+Codecs like H.264 fuse three ideas into one ("keyframe" = intra-coded =
+decoder reset = what you seek to). AV1 keeps them independent, and this
+project exists because of that separation:
+
+| concept | AV1 mechanism | stillcast usage |
+|---|---|---|
+| **intra coding** (coded without references) | `frame_type = KEY_FRAME` **or** `INTRA_ONLY_FRAME` — both are intra-coded | only at GOP boundaries |
+| **decoder reset / random access** | shown `KEY_FRAME` resets decoder state + refills all 8 ref slots; `INTRA_ONLY_FRAME` is intra but does *not* reset (and can't refresh all slots) | periodic `KEY_FRAME`s are the seek anchors |
+| **presentation** | `show_existing_frame` re-outputs a stored ref-buffer frame with zero coded data | ~99% of all TUs |
+
+Corollaries that matter here:
+
+- **`KEY_FRAME` is always intra** — "keyframe but not intra" is not a thing
+  in AV1. The independence is intra ↔ reset (KEY vs INTRA_ONLY) and
+  coding ↔ presentation (show_existing), not intra ↔ keyframe.
+- **The displayed picture need not be intra at all**: our golden — the frame
+  on screen for nearly the whole video — is a *shown inter frame*. It is
+  never itself coded again; only re-presented.
+- libaom already uses the same machinery internally (alt-ref/golden frame
+  hierarchy, show_existing for spatial layers); stillcast just drives it
+  explicitly at stream level.
+
 ## show_existing_frame semantics (5.9.2)
 
 A frame header may set `show_existing_frame = 1` followed by
