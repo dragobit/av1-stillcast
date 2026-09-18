@@ -120,10 +120,21 @@ enum Cmd {
         #[arg(long, default_value_t = 3600.0)]
         duration: f64,
     },
-    /// Inspect IVF input and report key/golden TUs and the golden slot.
+    /// Inspect an IVF stream. Without flags, validates an encoder-source
+    /// IVF (keyframe + golden). With --verbose / --check it analyzes an
+    /// assembled stillcast stream TU by TU.
     Info {
         #[arg(short, long)]
         input: PathBuf,
+        /// Per-TU dump: frame type, show_existing target, refreshed slots,
+        /// sizes, plus a structure summary.
+        #[arg(long)]
+        verbose: bool,
+        /// Assert the stillcast invariants (shown-KF start, no re-shown
+        /// keyframes, every TU shown, golden is INTER+showable). Exits
+        /// nonzero on violation.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -763,10 +774,72 @@ fn main() -> Result<()> {
             println!("(elementary stream; container adds ~12 B/frame ivf, ~4 B/frame mp4)");
             println!("(--target-seek N picks gop = N*fps directly in make/assemble)");
         }
-        Cmd::Info { input } => {
-            let data =
+        Cmd::Info {
+            input,
+            verbose,
+            check,
+        } => {
+            let mut data =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            if (verbose || check) && !data.starts_with(b"DKIF") {
+                // Non-IVF input (e.g. mp4): demux the video to IVF first.
+                let tmp = std::env::temp_dir().join("stillcast-info.ivf");
+                run(
+                    Command::new("ffmpeg")
+                        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+                        .arg(&input)
+                        .args(["-map", "0:v:0", "-c:v", "copy", "-f", "ivf"])
+                        .arg(&tmp),
+                    "ffmpeg demux to ivf",
+                )?;
+                data = std::fs::read(&tmp).context("reading demuxed ivf")?;
+            }
             let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
+            if verbose || check {
+                let rep = stillcast::inspect::analyze(&ivf).context("analyzing stream")?;
+                let sh = &rep.seq_header;
+                println!(
+                    "seq: {}x{} decoder_model={} equal_interval={} order_hint_bits={}",
+                    ivf.width,
+                    ivf.height,
+                    sh.decoder_model_info_present,
+                    sh.equal_picture_interval,
+                    sh.order_hint_bits
+                );
+                if verbose {
+                    for tu in &rep.tus {
+                        println!(
+                            "tu {:>6} ts={:>6} {:>6}B {}{}",
+                            tu.index,
+                            tu.timestamp,
+                            tu.bytes,
+                            if tu.has_seq_header { "seq+" } else { "" },
+                            stillcast::inspect::describe_kind(&tu.kind)
+                        );
+                    }
+                }
+                println!(
+                    "summary: {} TUs | {} shown keyframes (seek points) at {:?} | {} coded non-key | {} show_existing",
+                    rep.tus.len(),
+                    rep.key_tus.len(),
+                    rep.key_tus,
+                    rep.golden_tus.len(),
+                    rep.show_existing_tus.len()
+                );
+                if check {
+                    let mut failed = 0usize;
+                    for (name, ok, detail) in stillcast::inspect::checks(&rep) {
+                        println!("{} {name}: {detail}", if ok { "PASS" } else { "FAIL" });
+                        if !ok {
+                            failed += 1;
+                        }
+                    }
+                    if failed > 0 {
+                        anyhow::bail!("{failed} invariant(s) violated");
+                    }
+                }
+                return Ok(());
+            }
             let (key_tu, golden_tu) =
                 stillcast::assemble::split_input(&ivf).context("splitting input")?;
             let params = stillcast::assemble::AssembleParams {

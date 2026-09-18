@@ -65,6 +65,14 @@ ffmpeg -hide_banner -loglevel error -c:v libdav1d -i "$WORK/dm.ivf" \
     -f framemd5 "$WORK/dm.md5"
 diff <(awk '{print $6}' "$WORK/out.md5") <(awk '{print $6}' "$WORK/dm.md5")
 
+echo "== structure verification: info --check (stillcast invariants)"
+cargo run --quiet -- info -i "$WORK/out.ivf" --check
+cargo run --quiet -- info -i "$WORK/dm.ivf" --check
+# mp4 input path (demuxes internally), and keyframe positions must land
+# at the GOP boundary (gop=300 → TUs 0,300,600)
+cargo run --quiet -- info -i "$WORK/out.mp4" --check | tee "$WORK/info.txt"
+grep -q 'seek points) at \[0, 300, 600\]' "$WORK/info.txt"
+
 echo "== remux + seek sanity"
 ffmpeg -hide_banner -loglevel error -ss 20 -i "$WORK/out.mp4" -frames:v 1 -f null -
 
@@ -152,6 +160,10 @@ ffmpeg -hide_banner -loglevel error -ss 6.5 -c:v libdav1d -i "$WORK/pl.mp4" \
     -f framemd5 "$WORK/ss.md5"
 SS_HASH=$(awk '$1=="0,"{print $6; exit}' "$WORK/ss.md5")
 [ "$SS_HASH" = "$B_HASH" ]
+# structural check: 2 shown keyframes at TUs 0 and 150, all else show_existing
+cargo run --quiet -- info -i "$WORK/pl.mp4" --check | tee "$WORK/plinfo.txt"
+grep -q 'seek points) at \[0, 150\]' "$WORK/plinfo.txt"
+grep -q '356 show_existing' "$WORK/plinfo.txt"
 echo "playlist OK: switch at 5s keyframe, pixels verified"
 
 echo "== determinism: two runs must be byte-identical"
