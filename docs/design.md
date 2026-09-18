@@ -68,7 +68,19 @@ creation/modification times are zeroed to keep output byte-deterministic.
 
 The assembler is a pure bitstream→bitstream transform, which maps cleanly
 onto an **ffmpeg bitstream filter** (same shape as `av1_metadata` bsf):
-a `.ivf`/elementary AV1 input + a duration/gop parameter could become
-`ffmpeg -i src.ivf -c:v copy -bsf:v av1_stillcast=gop=300 out.ivf`.
-Planned as the long-term landing so the behavior is reachable through
-ffmpeg itself.
+
+```bash
+# one pipeline: libaom encodes the 2 real frames, bsf expands the stream
+ffmpeg -loop 1 -i jacket.png -i audio.m4a \
+    -c:v libaom-av1 -crf 32 -b:v 0 -r 30 -frames:v 2 \
+    -bsf:v av1_stillcast=gop=300:duration=3600 \
+    -c:a copy out.mp4
+```
+
+Division of labor inside ffmpeg: the `libaom-av1` encoder produces the real
+coded frames (keyframe + golden inter frame); the bsf does the GOP/TU
+expansion — no compression work. Parameters (`gop`, `duration`/`frames`,
+timescale) would be declared in a standard `AVOption`/`AVClass` table, so
+`key=val:key=val` syntax and `-h bsf=av1_stillcast` help come for free —
+the modern ffmpeg option convention. Planned as the long-term landing so
+the behavior is reachable through ffmpeg itself.
