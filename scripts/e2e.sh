@@ -46,6 +46,18 @@ echo "decoded frames: $DECODED (expected 900)"
 echo "== remux + seek sanity"
 ffmpeg -hide_banner -loglevel error -ss 20 -i "$WORK/out.mp4" -frames:v 1 -f null -
 
+echo "== stillcast make (image + audio -> mp4 in one step)"
+cargo run --quiet -- make -i "$WORK/still.png" -a "$WORK/audio.aac" \
+    -o "$WORK/made.mp4" --gop 300
+ffprobe -v error -show_entries stream=codec_name -of csv=p=0 \
+    "$WORK/made.mp4" | tee "$WORK/made.txt"
+grep -q '^av1$' "$WORK/made.txt"
+grep -q '^aac$' "$WORK/made.txt"
+DECODED=$(ffmpeg -hide_banner -i "$WORK/made.mp4" -map 0:v:0 -f null - \
+    2>&1 | grep -oE 'frame= *[0-9]+' | tail -1 | grep -oE '[0-9]+')
+echo "decoded frames: $DECODED (expected ~900)"
+[ "$DECODED" -ge 890 ]
+
 echo "== determinism: two runs must be byte-identical"
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.ivf" --frames 300 --gop 300
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.ivf" --frames 300 --gop 300

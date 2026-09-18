@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// AV1 bitstream assembler for static-image videos.
 ///
@@ -16,6 +17,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// One-shot: still image + audio -> video (mp4 or ivf).
+    ///
+    /// Drives ffmpeg for the 2-frame libaom encode and (when needed) the
+    /// audio -> ADTS conversion, then assembles. Requires ffmpeg on PATH.
+    Make {
+        /// Jacket/thumbnail image (png, jpg, ...).
+        #[arg(short, long)]
+        image: PathBuf,
+        /// Audio track: .aac/.adts is used as-is, anything else is
+        /// transcoded to AAC via ffmpeg. Ignored for .ivf output.
+        #[arg(short, long)]
+        audio: Option<PathBuf>,
+        /// Output path (.mp4 or .ivf).
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Output frame rate.
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Total output duration in seconds (defaults to audio duration).
+        #[arg(long)]
+        duration: Option<f64>,
+        /// GOP size in frames: distance between keyframes = seek granularity.
+        #[arg(long, default_value_t = 300)]
+        gop: u64,
+        /// libaom constant-quality level for the real frames.
+        #[arg(long, default_value_t = 32)]
+        crf: u32,
+        /// AAC bitrate when transcoding non-ADTS audio.
+        #[arg(long, default_value = "96k")]
+        audio_bitrate: String,
+        /// Keep the intermediate src.ivf / audio.aac next to the output.
+        #[arg(long)]
+        keep_work: bool,
+    },
     /// Assemble a long static-video AV1 bitstream from a 2-frame IVF encode.
     Assemble {
         /// Input IVF: >=2 frames; frame 0 = keyframe, frame 1 = golden (inter).
@@ -47,9 +82,225 @@ enum Cmd {
     },
 }
 
+fn run(cmd: &mut Command, what: &str) -> Result<()> {
+    let out = cmd
+        .output()
+        .with_context(|| format!("running {what} (is ffmpeg on PATH?)"))?;
+    if !out.status.success() {
+        anyhow::bail!("{what} failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+fn ffprobe_duration(path: &Path) -> Result<f64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .context("running ffprobe (is ffmpeg on PATH?)")?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .context("parsing ffprobe duration")
+}
+
+fn is_adts(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("aac") | Some("adts")
+    )
+}
+
+fn assemble_to_file(
+    input: &Path,
+    output: &Path,
+    fps: Option<u32>,
+    duration: Option<f64>,
+    frames: Option<u64>,
+    gop: u64,
+    audio: Option<&Path>,
+) -> Result<()> {
+    let data = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
+    let (key_tu, golden_tu) = stillcast::assemble::split_input(&ivf).context("splitting input")?;
+
+    let eff_fps = fps.unwrap_or_else(|| {
+        ivf.timebase_den
+            .checked_div(ivf.timebase_num.max(1))
+            .unwrap_or(30)
+            .max(1)
+    });
+    let total = if let Some(f) = frames {
+        f
+    } else if let Some(d) = duration {
+        (d * f64::from(eff_fps)).round() as u64
+    } else {
+        anyhow::bail!("specify --duration or --frames");
+    };
+
+    let params = stillcast::assemble::AssembleParams {
+        fps: eff_fps,
+        total_frames: total,
+        gop_size: gop,
+    };
+    let out = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
+    let n_samples = out.tus.len();
+
+    let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
+    if audio.is_some() && !is_mp4 {
+        anyhow::bail!("--audio requires mp4 output (-o out.mp4)");
+    }
+
+    let bytes = if is_mp4 {
+        let vtrack = stillcast::mp4::VideoTrack {
+            samples: out.tus.into_iter().map(stillcast::mp4::Sample).collect(),
+            sync_samples: out.key_samples,
+            width: ivf.width,
+            height: ivf.height,
+            timescale: eff_fps,
+            sample_delta: 1,
+            av1c: stillcast::mp4::build_av1c(&out.seq_header, &out.seq_header_obu),
+        };
+        let atrack = match audio {
+            Some(path) => {
+                let data =
+                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                let adts = stillcast::adts::parse(&data)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let total_bits: u64 = adts.frames.iter().map(|f| (f.len() + 7) as u64 * 8).sum();
+                let dur_secs =
+                    (adts.frames.len() as u64 * 1024) as f64 / f64::from(adts.sample_rate);
+                let avg = (total_bits as f64 / dur_secs.max(1e-6)) as u32;
+                Some(stillcast::mp4::AudioTrack {
+                    samples: adts
+                        .frames
+                        .into_iter()
+                        .map(stillcast::mp4::Sample)
+                        .collect(),
+                    audio_specific_config: adts.audio_specific_config.to_vec(),
+                    sample_rate: adts.sample_rate,
+                    channels: adts.channels,
+                    sample_delta: 1024,
+                    avg_bitrate: avg,
+                    max_bitrate: avg,
+                })
+            }
+            None => None,
+        };
+        stillcast::mp4::write(&vtrack, atrack.as_ref())?
+    } else {
+        let out_ivf = stillcast::assemble::to_ivf(&ivf, out.tus, fps);
+        stillcast::ivf::write(&out_ivf)
+    };
+    std::fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
+    println!(
+        "wrote {}: {} frames, {} B, golden slot {}, gop {}",
+        output.display(),
+        n_samples,
+        bytes.len(),
+        out.golden_slot,
+        gop
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Make {
+            image,
+            audio,
+            output,
+            fps,
+            duration,
+            gop,
+            crf,
+            audio_bitrate,
+            keep_work,
+        } => {
+            let work = if keep_work {
+                output
+                    .parent()
+                    .map(|p| p.join("stillcast-work"))
+                    .unwrap_or_else(|| PathBuf::from("stillcast-work"))
+            } else {
+                std::env::temp_dir().join(format!("stillcast-{}", std::process::id()))
+            };
+            std::fs::create_dir_all(&work)?;
+            let src_ivf = work.join("src.ivf");
+
+            run(
+                Command::new("ffmpeg")
+                    .args([
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-loop",
+                        "1",
+                        "-i",
+                    ])
+                    .arg(&image)
+                    .args(["-vf", "format=yuv420p", "-c:v", "libaom-av1", "-crf"])
+                    .arg(crf.to_string())
+                    .args(["-b:v", "0", "-cpu-used", "8", "-r"])
+                    .arg(fps.to_string())
+                    .args(["-frames:v", "4"])
+                    .arg(&src_ivf),
+                "libaom encode",
+            )?;
+
+            let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
+            let aac = match &audio {
+                Some(a) if is_mp4 => {
+                    if is_adts(a) {
+                        Some(a.clone())
+                    } else {
+                        let aac = work.join("audio.aac");
+                        run(
+                            Command::new("ffmpeg")
+                                .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+                                .arg(a)
+                                .args(["-c:a", "aac", "-b:a", &audio_bitrate, "-f", "adts"])
+                                .arg(&aac),
+                            "audio transcode",
+                        )?;
+                        Some(aac)
+                    }
+                }
+                _ => None,
+            };
+
+            let duration = match (duration, &audio) {
+                (Some(d), _) => Some(d),
+                (None, Some(a)) => Some(
+                    ffprobe_duration(a)
+                        .context("could not probe audio duration; pass --duration")?,
+                ),
+                (None, None) => anyhow::bail!("no --audio: pass --duration or --frames"),
+            };
+
+            assemble_to_file(
+                &src_ivf,
+                &output,
+                Some(fps),
+                duration,
+                None,
+                gop,
+                aac.as_deref(),
+            )?;
+
+            if !keep_work {
+                let _ = std::fs::remove_dir_all(&work);
+            }
+        }
         Cmd::Assemble {
             input,
             output,
@@ -59,91 +310,15 @@ fn main() -> Result<()> {
             gop,
             audio,
         } => {
-            let data =
-                std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
-            let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
-            let (key_tu, golden_tu) =
-                stillcast::assemble::split_input(&ivf).context("splitting input")?;
-
-            let eff_fps = fps.unwrap_or_else(|| {
-                ivf.timebase_den
-                    .checked_div(ivf.timebase_num.max(1))
-                    .unwrap_or(30)
-                    .max(1)
-            });
-            let total = if let Some(f) = frames {
-                f
-            } else if let Some(d) = duration {
-                (d * f64::from(eff_fps)).round() as u64
-            } else {
-                anyhow::bail!("specify --duration or --frames");
-            };
-
-            let params = stillcast::assemble::AssembleParams {
-                fps: eff_fps,
-                total_frames: total,
-                gop_size: gop,
-            };
-            let out = stillcast::assemble::assemble(&key_tu, &golden_tu, &params)?;
-            let n_samples = out.tus.len();
-
-            let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
-            if audio.is_some() && !is_mp4 {
-                anyhow::bail!("--audio requires mp4 output (-o out.mp4)");
-            }
-
-            let bytes = if is_mp4 {
-                let vtrack = stillcast::mp4::VideoTrack {
-                    samples: out.tus.into_iter().map(stillcast::mp4::Sample).collect(),
-                    sync_samples: out.key_samples,
-                    width: ivf.width,
-                    height: ivf.height,
-                    timescale: eff_fps,
-                    sample_delta: 1,
-                    av1c: stillcast::mp4::build_av1c(&out.seq_header, &out.seq_header_obu),
-                };
-                let atrack = match audio {
-                    Some(path) => {
-                        let data = std::fs::read(&path)
-                            .with_context(|| format!("reading {}", path.display()))?;
-                        let adts = stillcast::adts::parse(&data)
-                            .with_context(|| format!("parsing {}", path.display()))?;
-                        let total_bits: u64 =
-                            adts.frames.iter().map(|f| (f.len() + 7) as u64 * 8).sum();
-                        let dur_secs =
-                            (adts.frames.len() as u64 * 1024) as f64 / f64::from(adts.sample_rate);
-                        let avg = (total_bits as f64 / dur_secs.max(1e-6)) as u32;
-                        Some(stillcast::mp4::AudioTrack {
-                            samples: adts
-                                .frames
-                                .into_iter()
-                                .map(stillcast::mp4::Sample)
-                                .collect(),
-                            audio_specific_config: adts.audio_specific_config.to_vec(),
-                            sample_rate: adts.sample_rate,
-                            channels: adts.channels,
-                            sample_delta: 1024,
-                            avg_bitrate: avg,
-                            max_bitrate: avg,
-                        })
-                    }
-                    None => None,
-                };
-                stillcast::mp4::write(&vtrack, atrack.as_ref())?
-            } else {
-                let out_ivf = stillcast::assemble::to_ivf(&ivf, out.tus, fps);
-                stillcast::ivf::write(&out_ivf)
-            };
-            std::fs::write(&output, &bytes)
-                .with_context(|| format!("writing {}", output.display()))?;
-            println!(
-                "wrote {}: {} frames, {} B, golden slot {}, gop {}",
-                output.display(),
-                n_samples,
-                bytes.len(),
-                out.golden_slot,
-                gop
-            );
+            assemble_to_file(
+                &input,
+                &output,
+                fps,
+                duration,
+                frames,
+                gop,
+                audio.as_deref(),
+            )?;
         }
         Cmd::Info { input } => {
             let data =
