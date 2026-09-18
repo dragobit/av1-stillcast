@@ -43,6 +43,28 @@ DECODED=$(ffmpeg -hide_banner -i "$WORK/out.mp4" -map 0:v:0 -f null - \
 echo "decoded frames: $DECODED (expected 900)"
 [ "$DECODED" = "900" ]
 
+echo "== --decoder-model: decoder_model_info + buffer_removal_time_present_flag"
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/dm.ivf" \
+    --frames 900 --gop 300 --decoder-model
+# ffmpeg's strict cbs parser must accept every OBU (regression: stray '1'
+# in byte_alignment used to trip "zero_bit out of range")
+ffmpeg -hide_banner -c:v libdav1d -i "$WORK/dm.ivf" -f null - \
+    2> "$WORK/dm.log" || true
+if grep -qE "out of range|Failed to (read|parse)" "$WORK/dm.log"; then
+    cat "$WORK/dm.log"
+    exit 1
+fi
+DECODED=$(ffmpeg -hide_banner -c:v libdav1d -i "$WORK/dm.ivf" \
+    -f null - 2>&1 | grep -oE 'frame= *[0-9]+' | tail -1 | grep -oE '[0-9]+')
+echo "decoded frames: $DECODED (expected 900)"
+[ "$DECODED" = "900" ]
+# pixel-identical to the non-DM stream
+ffmpeg -hide_banner -loglevel error -c:v libdav1d -i "$WORK/out.ivf" \
+    -f framemd5 "$WORK/out.md5"
+ffmpeg -hide_banner -loglevel error -c:v libdav1d -i "$WORK/dm.ivf" \
+    -f framemd5 "$WORK/dm.md5"
+diff <(awk '{print $6}' "$WORK/out.md5") <(awk '{print $6}' "$WORK/dm.md5")
+
 echo "== remux + seek sanity"
 ffmpeg -hide_banner -loglevel error -ss 20 -i "$WORK/out.mp4" -frames:v 1 -f null -
 

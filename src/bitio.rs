@@ -108,6 +108,14 @@ impl BitWriter {
         }
     }
 
+    /// AV1 byte_alignment(): zero bits only, to a byte boundary — used inside
+    /// frame_obu between the uncompressed header and tile data.
+    pub fn byte_alignment(&mut self) {
+        while self.bit_pos != 0 {
+            self.f(1, 0);
+        }
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }

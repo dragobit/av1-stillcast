@@ -471,6 +471,39 @@ pub fn with_timing_info(sh: &SequenceHeader, fps: u32) -> SequenceHeader {
     out
 }
 
+/// Return a copy of `sh` with decoder_model_info() enabled (requires and
+/// implies timing_info). Frames gain only `buffer_removal_time_present_flag`
+/// (we always emit it as 0): equal_picture_interval makes decode timing
+/// implicit, so no removal-time fields are ever written.
+pub fn with_decoder_model(sh: &SequenceHeader, fps: u32) -> Result<SequenceHeader> {
+    let mut out = with_timing_info(sh, fps);
+    if sh.timing_info_present {
+        if !sh.equal_picture_interval {
+            bail!("decoder model on variable-interval streams would need temporal_point_info");
+        }
+        // Keep the source's declared timing.
+        out.num_units_in_display_tick = sh.num_units_in_display_tick;
+        out.time_scale = sh.time_scale;
+        out.num_ticks_per_picture_minus_1 = sh.num_ticks_per_picture_minus_1;
+    }
+    out.decoder_model_info_present = true;
+    out.buffer_delay_length_minus_1 = 31; // 32-bit delays
+    out.num_units_in_decoding_tick = fps;
+    // removal times we never emit would need <= 32 bits; 16 suffices as a
+    // legal declaration since the flag is 0 in every header.
+    out.buffer_removal_time_length_minus_1 = 15;
+    // presentation time must index every shown frame; 24 bits ≈ 155h @30fps.
+    out.frame_presentation_time_length_minus_1 = 23;
+    for op in &mut out.operating_points {
+        op.decoder_model_present = true;
+        // ~1 second of buffer at the nominal 1/90000 s units.
+        op.decoder_buffer_delay = 90_000;
+        op.encoder_buffer_delay = 90_000;
+        op.low_delay_mode = false;
+    }
+    Ok(out)
+}
+
 impl Default for SequenceHeader {
     fn default() -> Self {
         SequenceHeader {
