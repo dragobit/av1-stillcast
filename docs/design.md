@@ -34,6 +34,8 @@ GOP (repeated):
 | `seq_header` | full sequence-header walk → flags needed downstream |
 | `frame_header` | partial uncompressed-header parse (stops after refresh_frame_flags) |
 | `ivf` | IVF container read/write (packets = temporal units) |
+| `mp4` | ISOBMFF writer: ftyp+mdat+moov, av01/av1C + mp4a/esds, stss |
+| `adts` | ADTS parser → raw AAC frames + AudioSpecificConfig |
 | `assemble` | input validation, golden-slot selection, GOP expansion |
 | `main` | `stillcast assemble` / `stillcast info` CLI |
 
@@ -45,11 +47,28 @@ golden (a shown inter frame is what libaom emits for identical content).
 Rejected up front: reduced still-picture headers, frame id numbers,
 decoder-model timing info, film grain.
 
+## MP4 output
+
+Layout is `ftyp | mdat | moov` (mdat first, so chunk offsets are known in
+one pass). The video track carries an `av01` sample entry whose `av1C` box
+is derived from the parsed sequence header; keyframes land in `stss`, so
+seek granularity = gop. The audio track takes an ADTS file, strips the
+7-byte headers into `mp4a` samples, and writes `esds` with the
+AudioSpecificConfig. Timescales: video = fps, audio = sample rate; all
+creation/modification times are zeroed to keep output byte-deterministic.
+
 ## What is deliberately not done
 
-- **Muxing real containers** — IVF is a demo format; ffmpeg remuxes to
-  mp4/mkv fine. Native mp4 writer (stss sync table) is roadmap.
 - **Encoding** — libaom/ffmpeg remains the frame factory. Later we may drive
   it for a one-command flow.
 - **Refreshed/motion content** — the target is exactly-static visuals.
   Periodic jacket changes could be layered later as additional golden frames.
+
+## Path to ffmpeg
+
+The assembler is a pure bitstream→bitstream transform, which maps cleanly
+onto an **ffmpeg bitstream filter** (same shape as `av1_metadata` bsf):
+a `.ivf`/elementary AV1 input + a duration/gop parameter could become
+`ffmpeg -i src.ivf -c:v copy -bsf:v av1_stillcast=gop=300 out.ivf`.
+Planned as the long-term landing so the behavior is reachable through
+ffmpeg itself.

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# End-to-end check: encode a still → assemble → decode-verify with libdav1d.
+# End-to-end check: encode a still → assemble (ivf + mp4+audio) → verify.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-echo "== generate still"
+echo "== generate still + audio"
 ffmpeg -hide_banner -loglevel error -f lavfi \
     -i "testsrc2=size=320x180:rate=1:duration=1" -frames:v 1 "$WORK/still.png"
+ffmpeg -hide_banner -loglevel error -f lavfi \
+    -i "sine=frequency=440:duration=30" -c:a aac -b:a 96k -f adts -y "$WORK/audio.aac"
 
 echo "== encode source frames (KF + golden)"
 ffmpeg -hide_banner -loglevel error -loop 1 -i "$WORK/still.png" \
@@ -18,7 +20,7 @@ ffmpeg -hide_banner -loglevel error -loop 1 -i "$WORK/still.png" \
 echo "== stillcast info"
 cargo run --quiet -- info -i "$WORK/src.ivf"
 
-echo "== stillcast assemble"
+echo "== stillcast assemble → ivf"
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/out.ivf" \
     --frames 900 --gop 300
 
@@ -28,8 +30,36 @@ DECODED=$(ffmpeg -hide_banner -c:v libdav1d -i "$WORK/out.ivf" \
 echo "decoded frames: $DECODED (expected 900)"
 [ "$DECODED" = "900" ]
 
+echo "== stillcast assemble → mp4 (av01 + aac)"
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/out.mp4" \
+    --frames 900 --gop 300 --audio "$WORK/audio.aac"
+ffprobe -v error -show_entries stream=codec_name,nb_frames -of csv=p=0 \
+    "$WORK/out.mp4" | tee "$WORK/streams.txt"
+grep -q '^av1,900$' "$WORK/streams.txt"
+
+echo "== mp4 decode-verify"
+DECODED=$(ffmpeg -hide_banner -i "$WORK/out.mp4" -map 0:v:0 -f null - \
+    2>&1 | grep -oE 'frame= *[0-9]+' | tail -1 | grep -oE '[0-9]+')
+echo "decoded frames: $DECODED (expected 900)"
+[ "$DECODED" = "900" ]
+
 echo "== remux + seek sanity"
-ffmpeg -hide_banner -loglevel error -i "$WORK/out.ivf" -c copy -y "$WORK/out.mkv"
-ffmpeg -hide_banner -loglevel error -ss 20 -i "$WORK/out.mkv" -frames:v 1 -f null -
+ffmpeg -hide_banner -loglevel error -ss 20 -i "$WORK/out.mp4" -frames:v 1 -f null -
+
+echo "== determinism: two runs must be byte-identical"
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.ivf" --frames 300 --gop 300
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.ivf" --frames 300 --gop 300
+cmp "$WORK/a.ivf" "$WORK/b.ivf"
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.mp4" \
+    --frames 300 --gop 300 --audio "$WORK/audio.aac"
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.mp4" \
+    --frames 300 --gop 300 --audio "$WORK/audio.aac"
+cmp "$WORK/a.mp4" "$WORK/b.mp4"
+echo "deterministic OK"
+
+echo "== speed check: assemble 1 hour @30fps"
+time cargo run --quiet --release -- assemble -i "$WORK/src.ivf" \
+    -o "$WORK/big.ivf" --duration 3600 --gop 300
+ls -lh "$WORK/big.ivf"
 
 echo "E2E OK"

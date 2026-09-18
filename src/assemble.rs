@@ -69,24 +69,44 @@ fn lowest_refreshed_slot(flags: u8) -> Option<u8> {
     (0..8).find(|i| flags & (1 << i) != 0)
 }
 
+pub struct AssembleOutput {
+    pub tus: Vec<TemporalUnit>,
+    /// Reference slot the golden frame lives in (for debugging/inspection).
+    pub golden_slot: u8,
+    /// 1-based TU indices that are keyframes (seek anchors / mp4 stss).
+    pub key_samples: Vec<u32>,
+    /// The parsed sequence header of the input stream.
+    pub seq_header: crate::seq_header::SequenceHeader,
+    /// Full OBU bytes (header+size+payload) of the sequence header,
+    /// for embedding into av1C.
+    pub seq_header_obu: Vec<u8>,
+}
+
 /// Assemble the output temporal units.
 ///
 /// `key_tu`: TU containing (optionally seq header) + shown KEY_FRAME.
 /// `golden_tu`: TU containing a shown non-key frame of identical content
 ///   (must be decodable right after the key TU — i.e. produced by the real
 ///   encoder as the frame following the keyframe).
-/// Returns (temporal units, golden slot idx).
 pub fn assemble(
     key_tu: &[u8],
     golden_tu: &[u8],
     params: &AssembleParams,
-) -> Result<(Vec<TemporalUnit>, u8)> {
+) -> Result<AssembleOutput> {
     // --- validate the input TUs ---
-    let seq_payload = parse_obus(key_tu)?
-        .into_iter()
-        .find(|o| o.obu_type == ObuType::SequenceHeader)
-        .map(|o| o.payload)
-        .context("key temporal unit must contain a sequence header OBU")?;
+    let mut seq_header_obu = Vec::new();
+    let mut seq_payload = None;
+    for obu in parse_obus(key_tu)? {
+        if obu.obu_type == ObuType::SequenceHeader {
+            let mut full = Vec::new();
+            obu.write(&mut full);
+            seq_header_obu = full;
+            seq_payload = Some(obu.payload);
+            break;
+        }
+    }
+    let seq_payload =
+        seq_payload.context("key temporal unit must contain a sequence header OBU")?;
     let sh = crate::seq_header::parse_sequence_header(&seq_payload)?;
     sh.check_supported()
         .context("sequence header enables features this assembler does not support")?;
@@ -122,6 +142,7 @@ pub fn assemble(
     // --- emit ---
     let show_tu = show_existing_tu(golden_slot);
     let mut tus: Vec<TemporalUnit> = Vec::new();
+    let mut key_samples = Vec::new();
     let mut emitted = 0u64;
     while emitted < params.total_frames {
         let remaining = params.total_frames - emitted;
@@ -131,6 +152,7 @@ pub fn assemble(
             tus.push(show_tu.clone());
             break;
         }
+        key_samples.push(tus.len() as u32 + 1);
         tus.push(key_tu.to_vec());
         tus.push(golden_tu.to_vec());
         for _ in 2..gop {
@@ -138,7 +160,13 @@ pub fn assemble(
         }
         emitted += gop;
     }
-    Ok((tus, golden_slot))
+    Ok(AssembleOutput {
+        tus,
+        golden_slot,
+        key_samples,
+        seq_header: sh,
+        seq_header_obu,
+    })
 }
 
 /// Build an IVF from assembled TUs, preserving geometry and timebase.

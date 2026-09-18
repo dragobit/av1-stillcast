@@ -32,6 +32,12 @@ pub struct SequenceHeader {
     pub max_frame_height: u32,
     pub bit_depth: u8,
     pub mono_chrome: bool,
+    // --- needed to build the av1C record for mp4 muxing ---
+    pub seq_level_idx: u8,
+    pub seq_tier: u8,
+    pub subsample_x: bool,
+    pub subsample_y: bool,
+    pub chroma_sample_position: u8,
 }
 
 fn timing_info(r: &mut BitReader, sh: &mut SequenceHeader) -> Result<()> {
@@ -114,8 +120,10 @@ fn color_config(r: &mut BitReader, sh: &mut SequenceHeader) -> Result<()> {
                 }
             }
         };
+        sh.subsample_x = sub_x;
+        sh.subsample_y = sub_y;
         if sub_x && sub_y {
-            r.f(2)?; // chroma_sample_position
+            sh.chroma_sample_position = r.f(2)? as u8;
         }
     }
     r.f(1)?; // separate_uv_delta_q
@@ -144,6 +152,11 @@ pub fn parse_sequence_header(payload: &[u8]) -> Result<SequenceHeader> {
         max_frame_height: 0,
         bit_depth: 8,
         mono_chrome: false,
+        seq_level_idx: 0,
+        seq_tier: 0,
+        subsample_x: false,
+        subsample_y: false,
+        chroma_sample_position: 0,
     };
     anyhow::ensure!(sh.seq_profile <= 2, "seq_profile > 2");
 
@@ -163,11 +176,17 @@ pub fn parse_sequence_header(payload: &[u8]) -> Result<SequenceHeader> {
         let initial_display_delay_present = r.f(1)? == 1;
         let operating_points_cnt = (r.f(5)? + 1) as usize;
 
-        for _ in 0..operating_points_cnt {
+        for op in 0..operating_points_cnt {
             r.f(12)?; // operating_point_idc
-            let seq_level_idx = r.f(5)?;
+            let seq_level_idx = r.f(5)? as u8;
             if seq_level_idx > 7 {
-                r.f(1)?; // seq_tier
+                let t = r.f(1)? as u8;
+                if op == 0 {
+                    sh.seq_tier = t;
+                }
+            }
+            if op == 0 {
+                sh.seq_level_idx = seq_level_idx;
             }
             if sh.decoder_model_info_present {
                 let decoder_model_present_for_this_op = r.f(1)? == 1;

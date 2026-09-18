@@ -30,9 +30,11 @@ makes this legal, and [`docs/design.md`](docs/design.md) for the architecture.
 
 ## Status
 
-Early prototype. Produces IVF (`.ivf`) AV1 elementary streams; mux with
-ffmpeg (`ffmpeg -i out.ivf -c copy out.mkv/out.mp4`). Verified to decode
-frame-exact with libdav1d.
+Working prototype. Produces IVF (`.ivf`) elementary streams and **MP4**
+(av01 video track + optional mp4a/AAC audio track — YouTube-compatible
+layout), verified to decode frame-exact with libdav1d. Assembly is fully
+deterministic (same input → byte-identical output) and does no AV1
+compression work of its own — a 1-hour @30fps stream expands in ~30 ms.
 
 ## Usage
 
@@ -44,11 +46,16 @@ ffmpeg -loop 1 -i jacket.png -vf format=yuv420p \
 # 2. Inspect the input (finds the golden reference slot).
 stillcast info -i src.ivf
 
-# 3. Expand to a 1-hour video: 30 fps, keyframe every 300 frames (10 s seek).
+# 3a. Expand to IVF (1 hour, 30 fps, keyframe every 300 frames = 10 s seek).
 stillcast assemble -i src.ivf -o out.ivf --duration 3600 --gop 300
 
-# 4. Mux with audio.
-ffmpeg -i out.ivf -i podcast.opus -c copy episode.mkv
+# 3b. Or go straight to MP4 with audio (ADTS .aac input).
+ffmpeg -i podcast.m4a -c:a copy -f adts audio.aac   # if your audio is .m4a
+stillcast assemble -i src.ivf -o episode.mp4 \
+    --duration 3600 --gop 300 --audio audio.aac
+
+# IVF output can also be remuxed with plain ffmpeg.
+ffmpeg -i out.ivf -c copy out.mkv
 ```
 
 Each emitted GOP is: keyframe TU → golden TU → `show_existing_frame` TU ×
@@ -68,13 +75,16 @@ cargo test            # unit tests
 
 - [x] OBU / sequence header / uncompressed header parsing
 - [x] show_existing_frame TU synthesis + GOP assembler + IVF I/O
-- [ ] MP4/ISOBMFF output (`av01` sample entry, sync-sample table)
+- [x] MP4/ISOBMFF output (`av01` + `av1C`, `stss` sync table) + AAC mux
+- [ ] Audio input beyond ADTS (.m4a/.opus — needs a demuxer or ffmpeg pipe)
 - [ ] WebM/MKV output
 - [ ] Optional encode step (call libaom/ffmpeg directly on a still image)
 - [ ] Decoder-model / `temporal_point_info` support
 - [ ] Compatibility matrix: hw decoders, browsers, mobile players
 - [ ] "Limit-tracer" mode: pick gop/quality automatically from size or
       seek-granularity targets
+- [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
+      (`av1_stillcast` bsf) so the whole flow runs inside ffmpeg
 
 ## License
 
