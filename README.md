@@ -53,6 +53,8 @@ stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --gop 300
 stillcast plan -i src.ivf --duration 3600
 # ...or just state the seek requirement and let it pick gop:
 stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --target-seek 5
+# ...or state a size budget (raises crf until it fits):
+stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --max-size 500MB
 ```
 
 The explicit pipeline — drive libaom yourself, then assemble — stays
@@ -69,10 +71,12 @@ stillcast info -i src.ivf
 # 3a. Expand to IVF (1 hour, 30 fps, keyframe every 300 frames = 10 s seek).
 stillcast assemble -i src.ivf -o out.ivf --duration 3600 --gop 300
 
-# 3b. Or go straight to MP4 with audio (ADTS .aac input).
-ffmpeg -i podcast.m4a -c:a copy -f adts audio.aac   # if your audio is .m4a
+# 3b. Or go straight to MP4 with audio (any format ffmpeg reads).
 stillcast assemble -i src.ivf -o episode.mp4 \
-    --duration 3600 --gop 300 --audio audio.aac
+    --duration 3600 --gop 300 --audio podcast.m4a
+
+# 3c. Size budget: raise gop until the file fits (degrades seek).
+stillcast assemble -i src.ivf -o out.ivf --duration 3600 --max-size 2MB
 
 # IVF output can also be remuxed with plain ffmpeg.
 ffmpeg -i out.ivf -c copy out.mkv
@@ -98,15 +102,15 @@ cargo test            # unit tests
 - [x] MP4/ISOBMFF output (`av01` + `av1C`, `stss` sync table) + AAC mux
 - [x] `stillcast make`: image + audio → video in one command (drives ffmpeg
       for the encode/audio conversion)
-- [ ] Audio input beyond ADTS in `assemble` (.m4a/.opus — `make` already
-      transcodes via ffmpeg)
+- [x] Audio input: any ffmpeg-readable format → AAC (both `make` and
+      `assemble --audio`)
 - [ ] WebM/MKV output
 - [ ] Decoder-model / `temporal_point_info` support
-- [x] Limit-tracer v1: `stillcast plan` prints the size/seek table,
-      `--target-seek N` picks `gop = N*fps` (see `docs/roadmap.md`)
+- [x] Limit-tracer: `stillcast plan` size/seek table, `--target-seek N`
+      (gop = N×fps), `--max-size` (assemble: gop growth, make: crf ladder)
 - [ ] Compatibility matrix: hw decoders, browsers, mobile players
-      (plan: `docs/roadmap.md`)
-- [ ] Limit-tracer v2: `--max-size` CRF solving, multi-image playlists
+      → [`docs/compat.md`](docs/compat.md)
+- [ ] Multi-image playlists (multiple goldens, timed image switches)
 - [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
       (`av1_stillcast` bsf) — an *additional* path, not a replacement for
       the CLI flow above

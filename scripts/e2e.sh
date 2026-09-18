@@ -66,6 +66,24 @@ cargo run --quiet -- make -i "$WORK/still.png" -a "$WORK/audio.aac" \
 ffprobe -v error -show_entries stream=nb_frames -select_streams v \
     -of csv=p=0 "$WORK/ts.mp4" | grep -q '^300$'
 
+echo "== --max-size + non-ADTS audio"
+ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:duration=10" \
+    -c:a aac -b:a 128k -y "$WORK/audio.m4a"
+cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/ms.mp4" \
+    --frames 300 --gop 150 --audio "$WORK/audio.m4a"
+ffprobe -v error -show_entries stream=codec_name -of csv=p=0 \
+    "$WORK/ms.mp4" | grep -q '^aac$'
+MS_OUT=$(cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/ms2.ivf" \
+    --duration 3600 --gop 300 --max-size 2MB 2>&1)
+echo "$MS_OUT" | grep -q 'raised gop'
+S2=$(stat -c%s "$WORK/ms2.ivf")
+echo "max-size output: $S2 B (<= 2MB expected)"
+[ "$S2" -le 2097152 ]
+cargo run --quiet -- make -i "$WORK/still.png" -a "$WORK/audio.m4a" \
+    -o "$WORK/mm.mp4" --max-size 400KB --duration 10
+S3=$(stat -c%s "$WORK/mm.mp4")
+[ "$S3" -le 409600 ]
+
 echo "== determinism: two runs must be byte-identical"
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/a.ivf" --frames 300 --gop 300
 cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.ivf" --frames 300 --gop 300
