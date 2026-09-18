@@ -88,11 +88,12 @@ point:
 
 ```bash
 stillcast make --playlist tracks.txt -a album.m4a -o album.mp4
-# tracks.txt — `path [seconds]` per line, `#` comments; the last entry may
+# tracks.txt — `path [duration]` per line, `#` comments; the last entry may
 # omit its duration and fills the rest of the audio/--duration:
-#   cover1.png  180
-#   cover2.png  45.5
-#   cover3.png           # remainder
+#   cover1.png  180           # seconds
+#   cover2.png  5400f         # exact frame count (fps-independent)
+#   cover3.png  03:05.500     # ffmpeg-style MM:SS.mmm / HH:MM:SS.mmm / Ns
+#   cover4.png                # remainder
 stillcast assemble --playlist encoded.txt -o out.ivf --duration 3600
 # encoded.txt lists .ivf sources instead of images
 ```
