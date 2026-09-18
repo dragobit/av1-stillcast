@@ -1,0 +1,19 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+initialize: |
+  # Rust toolchain + ffmpeg (e2e encode/decode verification)
+  command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+maintenance: |
+  cargo fetch
+knowledge:
+  - name: lint
+    contents: |
+      cargo fmt --check && cargo clippy --all-targets -- -D warnings
+  - name: test
+    contents: |
+      cargo test && ./scripts/e2e.sh
+  - name: notes
+    contents: |
+      ffmpeg provides libaom-av1 (encode) and libdav1d (decode-verify); the e2e
+      script builds a still, encodes KF+golden, assembles, and counts
+      dav1d-decoded frames.
