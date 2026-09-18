@@ -28,6 +28,9 @@ trade-off knob directly:
 See [`docs/spec-notes.md`](docs/spec-notes.md) for the AV1 spec analysis that
 makes this legal, and [`docs/design.md`](docs/design.md) for the architecture.
 
+**Demo:** [`examples/demo.mp4`](examples/demo.mp4) — 30 s, 640×640@30, AV1 +
+AAC, 193 KB (rebuild with `./examples/make-demo.sh`).
+
 ## Status
 
 Working prototype. Produces IVF (`.ivf`) elementary streams and **MP4**
@@ -37,6 +40,18 @@ deterministic (same input → byte-identical output) and does no AV1
 compression work of its own — a 1-hour @30fps stream expands in ~30 ms.
 
 ## Usage
+
+The main flow is **image + audio → video**. One command (requires ffmpeg on
+PATH for the real-frame encode and audio handling):
+
+```bash
+# jacket art + podcast audio -> 1-hour YouTube-ready mp4.
+stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --gop 300
+# duration defaults to the audio duration; --fps/--crf/--audio-bitrate tunable
+```
+
+The explicit pipeline — drive libaom yourself, then assemble — stays
+first-class (full control over the encode, encoder swaps, scripting):
 
 ```bash
 # 1. Produce the source frames: a keyframe + one inter frame of the still.
@@ -76,15 +91,19 @@ cargo test            # unit tests
 - [x] OBU / sequence header / uncompressed header parsing
 - [x] show_existing_frame TU synthesis + GOP assembler + IVF I/O
 - [x] MP4/ISOBMFF output (`av01` + `av1C`, `stss` sync table) + AAC mux
-- [ ] Audio input beyond ADTS (.m4a/.opus — needs a demuxer or ffmpeg pipe)
+- [x] `stillcast make`: image + audio → video in one command (drives ffmpeg
+      for the encode/audio conversion)
+- [ ] Audio input beyond ADTS in `assemble` (.m4a/.opus — `make` already
+      transcodes via ffmpeg)
 - [ ] WebM/MKV output
-- [ ] Optional encode step (call libaom/ffmpeg directly on a still image)
 - [ ] Decoder-model / `temporal_point_info` support
 - [ ] Compatibility matrix: hw decoders, browsers, mobile players
+      (plan: `docs/roadmap.md`)
 - [ ] "Limit-tracer" mode: pick gop/quality automatically from size or
-      seek-granularity targets
+      seek-granularity targets (plan: `docs/roadmap.md`)
 - [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
-      (`av1_stillcast` bsf) so the whole flow runs inside ffmpeg
+      (`av1_stillcast` bsf) — an *additional* path, not a replacement for
+      the CLI flow above
 
 ## License
 
