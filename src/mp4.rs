@@ -66,6 +66,30 @@ pub struct AudioTrack {
     pub sample_delta: u32,
     pub avg_bitrate: u32,
     pub max_bitrate: u32,
+    /// ISO-639-2 3-letter language code (e.g. "eng"); `und` when None.
+    pub language: Option<String>,
+}
+
+/// Optional user-visible metadata copied from the input (iTunes-style ilst).
+/// Everything absent stays absent — output remains deterministic.
+#[derive(Default)]
+pub struct Meta {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    /// ISO date string, goes into ©day.
+    pub date: Option<String>,
+    /// Cover art bytes + ilst type: 13 = JPEG, 14 = PNG.
+    pub cover: Option<(Vec<u8>, u8)>,
+}
+
+/// Pack a 3-letter ISO-639-2 code into mdhd's 15-bit field.
+fn lang_bits(code: &str) -> u16 {
+    let b = code.as_bytes();
+    if b.len() != 3 || !b.iter().all(|c| c.is_ascii_lowercase()) {
+        return 0x55c4; // und
+    }
+    (u16::from(b[0] - 0x60) << 10) | (u16::from(b[1] - 0x60) << 5) | u16::from(b[2] - 0x60)
 }
 
 // ---------- av1C ----------
@@ -238,13 +262,13 @@ fn tkhd(track_id: u32, duration_ms: u32, w: u32, h: u32, volume: u16) -> Vec<u8>
     full_box(b"tkhd", 0, 3, &p) // enabled | in_movie
 }
 
-fn mdhd(timescale: u32, duration: u64) -> Vec<u8> {
+fn mdhd(timescale: u32, duration: u64, language: Option<&str>) -> Vec<u8> {
     let mut p = Vec::with_capacity(24);
     p.extend_from_slice(&u32be(0));
     p.extend_from_slice(&u32be(0));
     p.extend_from_slice(&u32be(timescale));
     p.extend_from_slice(&u32be(duration as u32));
-    p.extend_from_slice(&u16be(0x55c4)); // language: und
+    p.extend_from_slice(&u16be(language.map(lang_bits).unwrap_or(0x55c4)));
     p.extend_from_slice(&u16be(0));
     full_box(b"mdhd", 0, 0, &p)
 }
@@ -320,17 +344,70 @@ fn trak(track_id: u32, duration_ms: u32, tkhd_wh: (u32, u32), volume: u16, mdia:
     bx(b"trak", &t)
 }
 
-fn mdia(timescale: u32, media_duration: u64, hdlr_b: Vec<u8>, minf: Vec<u8>) -> Vec<u8> {
+fn mdia(
+    timescale: u32,
+    media_duration: u64,
+    language: Option<&str>,
+    hdlr_b: Vec<u8>,
+    minf: Vec<u8>,
+) -> Vec<u8> {
     let mut m = Vec::new();
-    m.extend_from_slice(&mdhd(timescale, media_duration));
+    m.extend_from_slice(&mdhd(timescale, media_duration, language));
     m.extend_from_slice(&hdlr_b);
     m.extend_from_slice(&minf);
     bx(b"mdia", &m)
 }
 
+// ---------- metadata (udta/meta/ilst) ----------
+
+fn data_atom(dtype: u8, payload: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(8 + payload.len());
+    p.extend_from_slice(&u32be(u32::from(dtype))); // version=0, flags=type
+    p.extend_from_slice(&u32be(0)); // locale
+    p.extend_from_slice(payload);
+    bx(b"data", &p)
+}
+
+fn ilst_item(fourcc: &[u8; 4], dtype: u8, payload: &[u8]) -> Vec<u8> {
+    bx(fourcc, &data_atom(dtype, payload))
+}
+
+/// moov-level udta carrying an iTunes-style meta/ilst. Only built when at
+/// least one field is present.
+fn udta(meta: &Meta) -> Option<Vec<u8>> {
+    let mut items = Vec::new();
+    if let Some(t) = &meta.title {
+        items.extend_from_slice(&ilst_item(b"\xa9nam", 1, t.as_bytes()));
+    }
+    if let Some(a) = &meta.artist {
+        items.extend_from_slice(&ilst_item(b"\xa9ART", 1, a.as_bytes()));
+    }
+    if let Some(a) = &meta.album {
+        items.extend_from_slice(&ilst_item(b"\xa9alb", 1, a.as_bytes()));
+    }
+    if let Some(d) = &meta.date {
+        items.extend_from_slice(&ilst_item(b"\xa9day", 1, d.as_bytes()));
+    }
+    if let Some((img, dtype)) = &meta.cover {
+        items.extend_from_slice(&ilst_item(b"covr", *dtype, img));
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let ilst = bx(b"ilst", &items);
+    let mut m = Vec::new();
+    m.extend_from_slice(&hdlr(b"mdir", "appl"));
+    m.extend_from_slice(&ilst);
+    Some(bx(b"udta", &full_box(b"meta", 0, 0, &m)))
+}
+
 /// Serialize the whole file. Video samples = temporal units in order.
 /// Audio is optional; when present both tracks mux into the same mdat.
-pub fn write(video: &VideoTrack, audio: Option<&AudioTrack>) -> Result<Vec<u8>> {
+pub fn write(
+    video: &VideoTrack,
+    audio: Option<&AudioTrack>,
+    meta: Option<&Meta>,
+) -> Result<Vec<u8>> {
     anyhow::ensure!(!video.samples.is_empty(), "no video samples");
 
     // ftyp: isom + isom/av01/iso8/mp41 compat
@@ -381,6 +458,7 @@ pub fn write(video: &VideoTrack, audio: Option<&AudioTrack>) -> Result<Vec<u8>> 
             let mdia = mdia(
                 video.timescale,
                 v_media_dur,
+                None,
                 hdlr(b"vide", "stillcast video"),
                 minf_video(&stbl),
             );
@@ -400,10 +478,14 @@ pub fn write(video: &VideoTrack, audio: Option<&AudioTrack>) -> Result<Vec<u8>> 
             let mdia = mdia(
                 a.sample_rate,
                 a_media_dur,
+                a.language.as_deref(),
                 hdlr(b"soun", "stillcast audio"),
                 minf_audio(&stbl),
             );
             moov.extend_from_slice(&trak(2, movie_dur_ms, (0, 0), 0x0100, &mdia));
+        }
+        if let Some(u) = meta.and_then(udta) {
+            moov.extend_from_slice(&u);
         }
         bx(b"moov", &moov)
     };
