@@ -1,7 +1,8 @@
 # Roadmap detail
 
-Concrete plans for the open roadmap items. `design.md` covers architecture;
-this covers what to build next and how to measure it.
+Concrete plans for the open roadmap items. `design.md` covers architecture
+(including the core / orchestration / external layer split); this covers
+what to build next and how to measure it.
 
 ## 1. Compatibility matrix (measure, don't speculate)
 
@@ -74,14 +75,33 @@ hw/broadcast pipelines accept our streams.
   `equal_picture_interval=1` still means `temporal_point_info` is never
   required in frame headers.
 
-## 4. ffmpeg bitstream filter (long-term, additive path)
+## 4. Layered CLI + ffmpeg delivery
 
-See `docs/design.md` §“Path to ffmpeg”. Key point for positioning: the
-CLI/`make` flow (image + audio → video) remains the product; the bsf makes
-the *stream transformation* reachable inside ffmpeg pipelines
-(`-bsf:v av1_stillcast=gop=300:duration=3600`) for users already living in
-ffmpeg. Parameters via `AVOption`/`AVClass`.
+See `docs/design.md` §“Layers” and §“Path to ffmpeg”. Direction agreed:
+keep one binary, but organize commands by responsibility — the **core**
+commands (`expand`, `plan`, `info`) stay a pure coded-frames-in →
+elementary-stream-out transform, while **orchestration** (`encode`,
+`make`) owns encode policy (probe, CRF ladder, uniform seq headers across
+playlist segments) and delegates codec execution to libaom via ffmpeg.
+Muxing, audio, and metadata belong to external tools; the built-in MP4
+writer becomes a dependency-free fallback and verification reference.
 
-Likely delivery: an FFmpeg fork tree or a standalone
-`libavcodec/bsf/av1_stillcast.c` patch + build doc, reusing this crate's
-assembler logic (either port to C or expose a C ABI from Rust).
+Staged delivery to ffmpeg-centric users:
+
+- [ ] **Pipe mode** — `expand`/`encode` read stdin and write stdout
+  (IVF/OBU), so the transform slots into stock ffmpeg pipelines today:
+  `stillcast encode -i img.png | stillcast expand --gop N | ffmpeg -f ivf -i - -i audio -c copy out.mp4`.
+  Includes renaming `assemble` → `expand` (alias kept) and splitting the
+  image→IVF step out of `make` into a public `encode` subcommand.
+- [ ] **C ABI** — expose the assembler core as a library; prerequisite for
+  any in-process embedding (bsf, GStreamer element, server-side use).
+- [ ] **ffmpeg bitstream filter** — `av1_stillcast` bsf
+  (`-bsf:v av1_stillcast=gop=300:duration=3600`), parameters via
+  `AVOption`/`AVClass`. Likely an FFmpeg fork tree or a standalone
+  `libavcodec/bsf/av1_stillcast.c` patch + build doc, reusing this crate's
+  assembler via the C ABI (or a C port).
+
+Beyond a single tool/distribution: a VP9 variant (VP9 also has
+`show_existing_frame`, reaching older AV1-less hardware) and library
+embedding for server-side on-demand generation are open possibilities the
+layer split keeps cheap.

@@ -8,6 +8,41 @@ policy, reference-slot bookkeeping, and cheap TU synthesis. That gives full
 control over the size/seek/compatibility frontier for ~5% of the effort of a
 codec.
 
+## Layers
+
+The tool is split into three layers, by who owns each decision:
+
+| layer | commands | owns |
+|---|---|---|
+| **core** | `expand`, `plan`, `info` | bitstream-structure decisions only: GOP/TU synthesis, golden-slot bookkeeping, the size↔seek cost model (`gop`, `--target-seek`, `--max-size`, `--duration`, `--fps`, `--playlist` segments, `--decoder-model`) |
+| **orchestration** | `encode`, `make` | encode *policy* — probe encodes, the CRF ladder, uniform encoder settings — while codec *execution* stays delegated to libaom via ffmpeg |
+| **external** | — | container muxing, audio processing, metadata, thumbnails: ffmpeg/MP4Box's job |
+
+The core layer is a pure bitstream→bitstream transform: coded AV1 frames
+(IVF/OBU) in, expanded AV1 elementary stream out. Everything else is built on
+top of it or delegated away from it.
+
+`encode` (image → 2-frame IVF) lives in the orchestration layer rather than
+outside the tool for two reasons:
+
+- **seq-header identity**: every `--playlist` segment must share a
+  byte-identical sequence-header payload. That invariant is only enforceable
+  when the tool drives every encode with identical settings; for arbitrary
+  user-supplied IVF, `expand` can only detect and reject mismatches.
+- **the cost model needs a probe**: `plan`/`--max-size` predict
+  `kf_size` from a 2-frame probe encode — effectively a two-pass flow
+  (measure → pick policy → real encode) that only works when the
+  orchestration layer can invoke the encoder itself.
+
+As an independent subcommand, `encode` is also a composable part for
+pipe-oriented users, e.g.
+`stillcast encode -i jacket.png | stillcast expand --gop 300 | ffmpeg -f ivf -i - -i audio.m4a -c copy out.mp4`.
+
+The hand-rolled MP4 muxer is demoted accordingly: not the only output path,
+but a dependency-free fallback and a verification reference. Distribution
+stays one binary with subcommands; splitting into separate tools is
+deferred until the ffmpeg bsf path (below) materializes.
+
 ## Stream layout
 
 ```
@@ -78,15 +113,25 @@ creation/modification times are zeroed to keep output byte-deterministic.
 
 ## What is deliberately not done
 
-- **Encoding** — libaom/ffmpeg remains the frame factory. Later we may drive
-  it for a one-command flow.
+- **Codec execution** — libaom/ffmpeg remains the frame factory; the tool
+  owns encode policy (probe, CRF ladder, uniform settings), never the
+  compression itself.
+- **Muxing, audio, metadata** — delegated to ffmpeg et al. The built-in MP4
+  writer is a fallback/verification path, not the product boundary.
 - **Refreshed/motion content** — the target is exactly-static visuals.
   Timed image switches exist via `--playlist` (per-segment keyframes).
 
 ## Path to ffmpeg
 
-The assembler is a pure bitstream→bitstream transform, which maps cleanly
-onto an **ffmpeg bitstream filter** (same shape as `av1_metadata` bsf):
+Delivery to ffmpeg-centric users is staged, each stage standing on its own:
+
+1. **Unix filter** — `expand`/`encode` accept stdin/emit stdout, so the
+   transform composes with stock ffmpeg today
+   (`ffmpeg … -f ivf - | stillcast expand | ffmpeg -i - …`).
+2. **C ABI** — expose the core assembler as a library, the prerequisite for
+   any in-process integration.
+3. **ffmpeg bitstream filter** — the transform maps cleanly onto a bsf
+   (same shape as `av1_metadata`):
 
 ```bash
 # one pipeline: libaom encodes the 2 real frames, bsf expands the stream
@@ -101,5 +146,11 @@ coded frames (keyframe + golden inter frame); the bsf does the GOP/TU
 expansion — no compression work. Parameters (`gop`, `duration`/`frames`,
 timescale) would be declared in a standard `AVOption`/`AVClass` table, so
 `key=val:key=val` syntax and `-h bsf=av1_stillcast` help come for free —
-the modern ffmpeg option convention. Planned as the long-term landing so
-the behavior is reachable through ffmpeg itself.
+the modern ffmpeg option convention. Since a bsf's I/O shape is identical
+to a pipe stage's, the layer split above is what makes this path cheap.
+
+Beyond a single tool, the same technique generalizes: VP9 has a
+`show_existing_frame` equivalent, opening a variant for older hardware
+without AV1 decode; and the ~30 ms fully-deterministic expansion suits
+embedding as a library in server-side pipelines (audio+cover → video at
+request time).
