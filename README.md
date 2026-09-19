@@ -57,8 +57,10 @@ stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --target-seek 5
 stillcast make -i jacket.png -a podcast.m4a -o episode.mp4 --max-size 500MB
 ```
 
-The explicit pipeline — drive libaom yourself, then assemble — stays
-first-class (full control over the encode, encoder swaps, scripting):
+The explicit pipeline — drive libaom yourself, then expand — stays
+first-class (full control over the encode, encoder swaps, scripting).
+All of `encode`, `expand`, `plan`, and `info` accept `-i -` / `-o -`
+for stdin/stdout, so they compose in shell pipelines with ffmpeg:
 
 ```bash
 # 1. Produce the source frames: a keyframe + one inter frame of the still.
@@ -69,17 +71,28 @@ ffmpeg -loop 1 -i jacket.png -vf format=yuv420p \
 stillcast info -i src.ivf
 
 # 3a. Expand to IVF (1 hour, 30 fps, keyframe every 300 frames = 10 s seek).
-stillcast assemble -i src.ivf -o out.ivf --duration 3600 --gop 300
+stillcast expand -i src.ivf -o out.ivf --duration 3600 --gop 300
 
 # 3b. Or go straight to MP4 with audio (any format ffmpeg reads).
-stillcast assemble -i src.ivf -o episode.mp4 \
+stillcast expand -i src.ivf -o episode.mp4 \
     --duration 3600 --gop 300 --audio podcast.m4a
 
 # 3c. Size budget: raise gop until the file fits (degrades seek).
-stillcast assemble -i src.ivf -o out.ivf --duration 3600 --max-size 2MB
+stillcast expand -i src.ivf -o out.ivf --duration 3600 --max-size 2MB
 
 # IVF output can also be remuxed with plain ffmpeg.
 ffmpeg -i out.ivf -c copy out.mkv
+```
+
+(`assemble` remains as an alias of `expand`.)
+
+Or as a pure pipeline — stillcast does encode + expand, ffmpeg does all
+container/audio work:
+
+```bash
+stillcast encode -i jacket.png -o - --fps 30 | \
+    stillcast expand -i - -o - --duration 3600 --gop 300 | \
+    ffmpeg -f ivf -i - -i podcast.m4a -c copy episode.mp4
 ```
 
 Multi-image playlists (e.g. per-song jacket switches in an album video) —
@@ -94,7 +107,7 @@ stillcast make --playlist tracks.txt -a album.m4a -o album.mp4
 #   cover2.png  5400f         # exact frame count (fps-independent)
 #   cover3.png  03:05.500     # ffmpeg-style MM:SS.mmm / HH:MM:SS.mmm / Ns
 #   cover4.png                # remainder
-stillcast assemble --playlist encoded.txt -o out.ivf --duration 3600
+stillcast expand --playlist encoded.txt -o out.ivf --duration 3600
 # encoded.txt lists .ivf sources instead of images
 ```
 
@@ -141,7 +154,10 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
 - [x] `stillcast make`: image + audio → video in one command (drives ffmpeg
       for the encode/audio conversion)
 - [x] Audio input: any ffmpeg-readable format → AAC (both `make` and
-      `assemble --audio`)
+      `expand --audio`)
+- [x] Pipe mode: `encode`/`expand`/`plan`/`info` accept `-i -` / `-o -`
+      (stdin/stdout); `expand` = renamed `assemble` (alias kept), public
+      `encode` subcommand split out of `make`
 - [ ] WebM/MKV output
 - [x] Decoder-model: `--decoder-model` emits `decoder_model_info` +
       `buffer_removal_time_present_flag` (opt-in; `equal_picture_interval`
@@ -152,8 +168,6 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
       → [`docs/compat.md`](docs/compat.md)
 - [x] Multi-image playlists: `--playlist` on `make`/`assemble`, timed
       switches, every switch is a keyframe (a real seek point)
-- [ ] Pipe mode: `expand`/`encode` on stdin/stdout so the transform slots
-      into stock ffmpeg pipelines (see `docs/design.md` §Layers)
 - [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
       (`av1_stillcast` bsf) — an *additional* path, not a replacement for
       the CLI flow above
