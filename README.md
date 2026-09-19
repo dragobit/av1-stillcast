@@ -152,6 +152,8 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
       → [`docs/compat.md`](docs/compat.md)
 - [x] Multi-image playlists: `--playlist` on `make`/`assemble`, timed
       switches, every switch is a keyframe (a real seek point)
+- [ ] Pipe mode: `expand`/`encode` on stdin/stdout so the transform slots
+      into stock ffmpeg pipelines (see `docs/design.md` §Layers)
 - [ ] Long-term: same transformation as an **ffmpeg bitstream filter**
       (`av1_stillcast` bsf) — an *additional* path, not a replacement for
       the CLI flow above
