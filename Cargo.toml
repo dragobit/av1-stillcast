@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "AV1 bitstream assembler specialized for static-image videos (podcasts, music) using show_existing_frame + long-lived golden references"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

@@ -158,6 +158,9 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
 - [x] Pipe mode: `encode`/`expand`/`plan`/`info` accept `-i -` / `-o -`
       (stdin/stdout); `expand` = renamed `assemble` (alias kept), public
       `encode` subcommand split out of `make`
+- [x] Library + C ABI: `expand_ivf`/`expand_ivf_multi` (bytes in → IVF
+      bytes out) and `stillcast_expand`/`stillcast_free` →
+      `libstillcast.{so,a}` + `include/stillcast.h`
 - [ ] WebM/MKV output
 - [x] Decoder-model: `--decoder-model` emits `decoder_model_info` +
       `buffer_removal_time_present_flag` (opt-in; `equal_picture_interval`

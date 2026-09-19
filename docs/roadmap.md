@@ -88,18 +88,23 @@ writer becomes a dependency-free fallback and verification reference.
 
 Staged delivery to ffmpeg-centric users:
 
-- [ ] **Pipe mode** — `expand`/`encode` read stdin and write stdout
+- [x] **Pipe mode** — `expand`/`encode` read stdin and write stdout
   (IVF/OBU), so the transform slots into stock ffmpeg pipelines today:
   `stillcast encode -i img.png | stillcast expand --gop N | ffmpeg -f ivf -i - -i audio -c copy out.mp4`.
   Includes renaming `assemble` → `expand` (alias kept) and splitting the
   image→IVF step out of `make` into a public `encode` subcommand.
-- [ ] **C ABI** — expose the assembler core as a library; prerequisite for
-  any in-process embedding (bsf, GStreamer element, server-side use).
+- [x] **C ABI** — `api` module holds the stable bytes-in→bytes-out
+  contract (`expand_ivf` / `expand_ivf_multi`); `ffi` is a thin shim
+  (`stillcast_expand` / `stillcast_free` / `stillcast_last_error`, see
+  `include/stillcast.h`). Build emits `libstillcast.{so,a}` via the
+  `cdylib` crate-type. Prerequisite for in-process embedding (bsf,
+  GStreamer element, server-side use).
 - [ ] **ffmpeg bitstream filter** — `av1_stillcast` bsf
   (`-bsf:v av1_stillcast=gop=300:duration=3600`), parameters via
-  `AVOption`/`AVClass`. Likely an FFmpeg fork tree or a standalone
-  `libavcodec/bsf/av1_stillcast.c` patch + build doc, reusing this crate's
-  assembler via the C ABI (or a C port).
+  `AVOption`/`AVClass`. Two delivery shapes: an FFmpeg fork/static build
+  that calls the C ABI above (`libavcodec/bsf/av1_stillcast.c` as a thin
+  wrapper), or a C port of the assembler if upstreaming is the goal
+  (upstream ffmpeg takes no Rust dep — decide by distribution target).
 
 Beyond a single tool/distribution: a VP9 variant (VP9 also has
 `show_existing_frame`, reaching older AV1-less hardware) and library
