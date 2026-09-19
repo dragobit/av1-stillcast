@@ -376,6 +376,8 @@ fn build_output(
     fps: Option<u32>,
     gop: u64,
     audio: Option<&Path>,
+    audio_lang: Option<&str>,
+    meta: Option<&stillcast::mp4::Meta>,
     decoder_model: bool,
 ) -> Result<(Vec<u8>, usize, u8, u32, u64)> {
     let ivf = donor;
@@ -443,11 +445,12 @@ fn build_output(
                     sample_delta: 1024,
                     avg_bitrate: avg,
                     max_bitrate: avg,
+                    language: audio_lang.map(str::to_string),
                 })
             }
             None => None,
         };
-        stillcast::mp4::write(&vtrack, atrack.as_ref())?
+        stillcast::mp4::write(&vtrack, atrack.as_ref(), meta)?
     } else {
         let out_ivf = stillcast::assemble::to_ivf(ivf, out.tus, fps);
         stillcast::ivf::write(&out_ivf)
@@ -474,22 +477,127 @@ fn write_output(
     Ok(())
 }
 
-/// Transcode audio to ADTS via ffmpeg into `work_dir`, or return the
-/// original path when it is already ADTS.
+fn ffprobe_out(path: &Path, entries: &str, extra: &[&str]) -> Option<String> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(extra)
+        .args(["-show_entries", entries, "-of", "default=nw=1"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn audio_codec(path: &Path) -> Option<String> {
+    ffprobe_out(path, "stream=codec_name", &["-select_streams", "a:0"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Remux/transcode audio to ADTS into `work_dir`, or return the original
+/// path when it is already ADTS. AAC inputs are stream-copied — the
+/// bitstream is reused verbatim, never re-encoded.
 fn ensure_adts(audio: &Path, work_dir: &Path, bitrate: &str) -> Result<PathBuf> {
     if is_adts(audio) {
         return Ok(audio.to_path_buf());
     }
     let out = work_dir.join("audio.aac");
-    run(
-        Command::new("ffmpeg")
-            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-            .arg(audio)
-            .args(["-c:a", "aac", "-b:a", bitrate, "-f", "adts"])
-            .arg(&out),
-        "audio transcode",
-    )?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(audio);
+    if audio_codec(audio).as_deref() == Some("aac") {
+        cmd.args(["-c:a", "copy", "-f", "adts"]);
+    } else {
+        cmd.args(["-c:a", "aac", "-b:a", bitrate, "-f", "adts"]);
+    }
+    cmd.arg(&out);
+    run(&mut cmd, "audio to adts")?;
     Ok(out)
+}
+
+/// Language tag of the first audio stream (ISO-639-2, e.g. "eng").
+fn audio_language(path: &Path) -> Option<String> {
+    ffprobe_out(path, "stream_tags=language", &["-select_streams", "a:0"])
+        .map(|s| s.trim().trim_start_matches("TAG:language=").to_string())
+        .filter(|s| !s.is_empty() && s != "und")
+}
+
+/// Format-level tags of the source container (title/artist/album/date).
+fn probe_format_tags(path: &Path) -> Vec<(String, String)> {
+    let Some(txt) = ffprobe_out(path, "format_tags", &[]) else {
+        return Vec::new();
+    };
+    txt.lines()
+        .filter_map(|l| l.trim().strip_prefix("TAG:"))
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_lowercase(), v.to_string()))
+        .collect()
+}
+
+/// ilst cover-art type from magic bytes: 13 = JPEG, 14 = PNG.
+fn image_dtype(bytes: &[u8]) -> Option<u8> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(13)
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]) {
+        Some(14)
+    } else {
+        None
+    }
+}
+
+/// Pull the attached picture (cover art) out of an audio file, if any.
+fn extract_cover(audio: &Path, work_dir: &Path) -> Option<(Vec<u8>, u8)> {
+    let out = work_dir.join("cover.bin");
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(audio)
+        .args([
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-c",
+            "copy",
+            "-f",
+            "image2",
+        ])
+        .arg(&out)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let bytes = std::fs::read(&out).ok()?;
+    image_dtype(&bytes).map(|t| (bytes, t))
+}
+
+/// Metadata to carry into the mp4: source tags plus cover art. Cover falls
+/// back to `cover_fallback` (typically the -i still image) when the audio
+/// has no attached picture.
+fn probe_meta(
+    audio: &Path,
+    work_dir: &Path,
+    cover_fallback: Option<&Path>,
+) -> stillcast::mp4::Meta {
+    let mut meta = stillcast::mp4::Meta::default();
+    for (k, v) in probe_format_tags(audio) {
+        match k.as_str() {
+            "title" => meta.title = Some(v),
+            "artist" => meta.artist = Some(v),
+            "album" => meta.album = Some(v),
+            "date" | "creation_time" if meta.date.is_none() => meta.date = Some(v),
+            _ => {}
+        }
+    }
+    meta.cover = extract_cover(audio, work_dir).or_else(|| {
+        let bytes = std::fs::read(cover_fallback?).ok()?;
+        image_dtype(&bytes).map(|t| (bytes, t))
+    });
+    meta
 }
 
 /// Load every input IVF and extract (key TU, golden TU) pairs.
@@ -533,6 +641,8 @@ fn fit_gop_for_size(
     fps: Option<u32>,
     gop: u64,
     audio: Option<&Path>,
+    audio_lang: Option<&str>,
+    meta: Option<&stillcast::mp4::Meta>,
     max_bytes: u64,
     decoder_model: bool,
 ) -> Result<(Vec<u8>, usize, u8, u64, bool)> {
@@ -546,6 +656,8 @@ fn fit_gop_for_size(
             fps,
             g,
             audio,
+            audio_lang,
+            meta,
             decoder_model,
         )?;
         let fits = bytes.len() as u64 <= max_bytes;
@@ -598,6 +710,21 @@ fn main() -> Result<()> {
                 Some(a) if is_mp4 => Some(ensure_adts(a, &work, &audio_bitrate)?),
                 _ => None,
             };
+            // Carry source metadata (language, tags, cover) into the mp4.
+            // Cover falls back to the first still image when the audio has
+            // no attached picture.
+            let meta = match &audio {
+                Some(a) if is_mp4 => Some(probe_meta(
+                    a,
+                    &work,
+                    entries.first().map(|e| e.path.as_path()),
+                )),
+                _ => None,
+            };
+            let alang = match &audio {
+                Some(a) if is_mp4 => audio_language(a),
+                _ => None,
+            };
 
             let total_secs = match (duration, &audio) {
                 (Some(d), _) => Some(d),
@@ -638,6 +765,8 @@ fn main() -> Result<()> {
                     Some(fps),
                     gop,
                     aac.as_deref(),
+                    alang.as_deref(),
+                    meta.as_ref(),
                     decoder_model,
                 ) {
                     Ok((bytes, n, slot, _, _)) => {
@@ -728,6 +857,14 @@ fn main() -> Result<()> {
                 }
                 _ => audio.clone(),
             };
+            let meta = match &audio {
+                Some(a) if is_mp4 => Some(probe_meta(a, &work, None)),
+                _ => None,
+            };
+            let alang = match &audio {
+                Some(a) if is_mp4 => audio_language(a),
+                _ => None,
+            };
 
             match max_size.map(|s| parse_size(&s)).transpose()? {
                 Some(budget) => {
@@ -739,6 +876,8 @@ fn main() -> Result<()> {
                         fps,
                         gop,
                         aac.as_deref(),
+                        alang.as_deref(),
+                        meta.as_ref(),
                         budget,
                         decoder_model,
                     )?;
@@ -763,6 +902,8 @@ fn main() -> Result<()> {
                         fps,
                         gop,
                         aac.as_deref(),
+                        alang.as_deref(),
+                        meta.as_ref(),
                         decoder_model,
                     )?;
                     write_output(&output, &bytes, n, slot, gop)?;
