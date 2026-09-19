@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -68,10 +69,15 @@ enum Cmd {
         #[arg(long)]
         keep_work: bool,
     },
-    /// Assemble a long static-video AV1 bitstream from a 2-frame IVF encode.
-    Assemble {
+    /// Expand a 2-frame IVF encode into a long static-video AV1 bitstream.
+    ///
+    /// Pure coded-frames-in → elementary-stream-out transform; `-i -` reads
+    /// the IVF from stdin and `-o -` writes IVF to stdout, so it composes
+    /// with ffmpeg in a shell pipeline.
+    #[command(name = "expand", visible_alias = "assemble")]
+    Expand {
         /// Input IVF: >=2 frames; frame 0 = keyframe, frame 1 = golden (inter).
-        /// Mutually exclusive with --playlist.
+        /// `-` reads stdin. Mutually exclusive with --playlist.
         #[arg(short, long, conflicts_with = "playlist")]
         input: Option<PathBuf>,
         /// Playlist file: one `input.ivf [duration]` per line (# comments,
@@ -79,7 +85,7 @@ enum Cmd {
         /// Duration forms: seconds | Ns | Nf (frames) | MM:SS[.mmm] | HH:MM:SS[.mmm].
         #[arg(long)]
         playlist: Option<PathBuf>,
-        /// Output IVF path.
+        /// Output path: `.ivf` / `.mp4`, or `-` for stdout (always IVF).
         #[arg(short, long)]
         output: PathBuf,
         /// Output frame rate (overrides input timebase).
@@ -110,9 +116,26 @@ enum Cmd {
         #[arg(long)]
         decoder_model: bool,
     },
+    /// Encode a still image to a short IVF (keyframe + golden inter frames)
+    /// by driving libaom via ffmpeg. `-i -` reads the image from stdin,
+    /// `-o -` writes IVF to stdout. Requires ffmpeg on PATH.
+    Encode {
+        /// Input image (png, jpg, ...), or `-` for stdin.
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Output IVF path, or `-` for stdout.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Output frame rate written into the IVF timebase and the encode.
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// libaom constant-quality level.
+        #[arg(long, default_value_t = 32)]
+        crf: u32,
+    },
     /// Size/seek frontier: project stream size and worst seek latency per gop.
     Plan {
-        /// Input IVF (same contract as assemble).
+        /// Input IVF (same contract as expand), or `-` for stdin.
         #[arg(short, long)]
         input: PathBuf,
         /// Output frame rate (overrides input timebase).
@@ -126,6 +149,7 @@ enum Cmd {
     /// IVF (keyframe + golden). With --verbose / --check it analyzes an
     /// assembled stillcast stream TU by TU.
     Info {
+        /// Input path (.ivf or .mp4), or `-` for stdin.
         #[arg(short, long)]
         input: PathBuf,
         /// Per-TU dump: frame type, show_existing target, refreshed slots,
@@ -144,6 +168,23 @@ fn resolve_gop(gop: u64, target_seek: Option<f64>, fps: u32) -> u64 {
     match target_seek {
         Some(s) => (s * f64::from(fps)).round().max(2.0) as u64,
         None => gop,
+    }
+}
+
+fn is_stdio(p: &Path) -> bool {
+    p == Path::new("-")
+}
+
+fn read_input(path: &Path) -> Result<Vec<u8>> {
+    if is_stdio(path) {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .lock()
+            .read_to_end(&mut buf)
+            .context("reading stdin")?;
+        Ok(buf)
+    } else {
+        std::fs::read(path).with_context(|| format!("reading {}", path.display()))
     }
 }
 
@@ -465,6 +506,20 @@ fn write_output(
     golden_slot: u8,
     gop: u64,
 ) -> Result<()> {
+    if is_stdio(output) {
+        std::io::stdout()
+            .lock()
+            .write_all(bytes)
+            .context("writing stdout")?;
+        eprintln!(
+            "wrote stdout: {} frames, {} B, golden slot {}, gop {}",
+            n_samples,
+            bytes.len(),
+            golden_slot,
+            gop
+        );
+        return Ok(());
+    }
     std::fs::write(output, bytes).with_context(|| format!("writing {}", output.display()))?;
     println!(
         "wrote {}: {} frames, {} B, golden slot {}, gop {}",
@@ -614,7 +669,7 @@ fn load_pairs(
     let mut donor = None;
     let mut pairs = Vec::new();
     for p in paths {
-        let data = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+        let data = read_input(p)?;
         let ivf =
             stillcast::ivf::read(&data).with_context(|| format!("parsing {}", p.display()))?;
         let pair = stillcast::assemble::split_input(&ivf)
@@ -802,7 +857,7 @@ fn main() -> Result<()> {
                 let _ = std::fs::remove_dir_all(&work);
             }
         }
-        Cmd::Assemble {
+        Cmd::Expand {
             input,
             playlist,
             output,
@@ -838,6 +893,10 @@ fn main() -> Result<()> {
             });
             let gop = resolve_gop(gop, target_seek, eff_fps);
             let is_mp4 = is_mp4_path(&output);
+            anyhow::ensure!(
+                !is_stdio(&output) || audio.is_none(),
+                "--audio requires mp4 output; stdout is IVF only"
+            );
 
             // --frames counts total output; otherwise --duration (or the sum
             // of per-segment playlist durations) gives the length. A trailing
@@ -911,13 +970,48 @@ fn main() -> Result<()> {
             }
             let _ = std::fs::remove_dir_all(&work);
         }
+        Cmd::Encode {
+            input,
+            output,
+            fps,
+            crf,
+        } => {
+            let work = std::env::temp_dir().join(format!("stillcast-enc-{}", std::process::id()));
+            std::fs::create_dir_all(&work)?;
+            let src = if is_stdio(&input) {
+                let data = read_input(&input)?;
+                let p = work.join("stdin.img");
+                std::fs::write(&p, &data).context("staging stdin image")?;
+                p
+            } else {
+                input.clone()
+            };
+            let (dest, staged) = if is_stdio(&output) {
+                (work.join("out.ivf"), true)
+            } else {
+                (output.clone(), false)
+            };
+            encode_still(&src, fps, crf, &dest)?;
+            if staged {
+                let bytes =
+                    std::fs::read(&dest).with_context(|| format!("reading {}", dest.display()))?;
+                std::io::stdout()
+                    .lock()
+                    .write_all(&bytes)
+                    .context("writing stdout")?;
+                eprintln!("wrote stdout: {} B", bytes.len());
+            } else {
+                let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                println!("wrote {}: {} B", dest.display(), size);
+            }
+            let _ = std::fs::remove_dir_all(&work);
+        }
         Cmd::Plan {
             input,
             fps,
             duration,
         } => {
-            let data =
-                std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            let data = read_input(&input)?;
             let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
             let (key_tu, golden_tu) =
                 stillcast::assemble::split_input(&ivf).context("splitting input")?;
@@ -975,15 +1069,23 @@ fn main() -> Result<()> {
             verbose,
             check,
         } => {
-            let mut data =
-                std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            let mut data = read_input(&input)?;
             if (verbose || check) && !data.starts_with(b"DKIF") {
                 // Non-IVF input (e.g. mp4): demux the video to IVF first.
+                // stdin input has no path for ffmpeg, so stage it.
+                let staged;
+                let src = if is_stdio(&input) {
+                    staged = std::env::temp_dir().join("stillcast-info-src.mp4");
+                    std::fs::write(&staged, &data).context("staging stdin")?;
+                    &staged
+                } else {
+                    &input
+                };
                 let tmp = std::env::temp_dir().join("stillcast-info.ivf");
                 run(
                     Command::new("ffmpeg")
                         .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-                        .arg(&input)
+                        .arg(src)
                         .args(["-map", "0:v:0", "-c:v", "copy", "-f", "ivf"])
                         .arg(&tmp),
                     "ffmpeg demux to ivf",
