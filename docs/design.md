@@ -89,8 +89,10 @@ model across segments in decode order.
 | `ivf` | IVF container read/write (packets = temporal units) |
 | `mp4` | ISOBMFF writer: ftyp+mdat+moov, av01/av1C + mp4a/esds, stss |
 | `adts` | ADTS parser → raw AAC frames + AudioSpecificConfig |
+| `api` | stable crate API: bytes-in→bytes-out `expand_ivf*` |
+| `ffi` | C ABI shim over `api` (`stillcast_expand`/`stillcast_free`) |
 | `assemble` | input validation, golden-slot selection, GOP expansion |
-| `main` | `stillcast assemble` / `stillcast info` CLI |
+| `main` | `stillcast` CLI (`make`/`expand`/`encode`/`plan`/`info`) |
 
 ## Input contract
 
@@ -125,11 +127,14 @@ creation/modification times are zeroed to keep output byte-deterministic.
 
 Delivery to ffmpeg-centric users is staged, each stage standing on its own:
 
-1. **Unix filter** — `expand`/`encode` accept stdin/emit stdout, so the
-   transform composes with stock ffmpeg today
+1. **Unix filter** (done) — `expand`/`encode` accept stdin/emit stdout, so
+   the transform composes with stock ffmpeg today
    (`ffmpeg … -f ivf - | stillcast expand | ffmpeg -i - …`).
-2. **C ABI** — expose the core assembler as a library, the prerequisite for
-   any in-process integration.
+2. **C ABI** (done) — `src/api.rs` is the stable bytes-in→bytes-out crate
+   API (`expand_ivf`/`expand_ivf_multi`); `src/ffi.rs` is a thin shim over
+   it (`stillcast_expand`, `stillcast_free`, `stillcast_last_error`,
+   `include/stillcast.h`). `cargo build --release` emits
+   `libstillcast.{so,a}` (crate-type `cdylib`).
 3. **ffmpeg bitstream filter** — the transform maps cleanly onto a bsf
    (same shape as `av1_metadata`):
 
@@ -148,6 +153,9 @@ timescale) would be declared in a standard `AVOption`/`AVClass` table, so
 `key=val:key=val` syntax and `-h bsf=av1_stillcast` help come for free —
 the modern ffmpeg option convention. Since a bsf's I/O shape is identical
 to a pipe stage's, the layer split above is what makes this path cheap.
+Delivery splits by target: a fork/static build calls the C ABI (Rust logic
+reused verbatim); upstreaming requires a C port since ffmpeg takes no Rust
+dependency — decide when the distribution target is known.
 
 Beyond a single tool, the same technique generalizes: VP9 has a
 `show_existing_frame` equivalent, opening a variant for older hardware
