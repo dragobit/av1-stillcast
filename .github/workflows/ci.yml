@@ -21,6 +21,8 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # lib only: proves the cdylib/rlib builds without the CLI dep tree
+      - run: cargo build --release --no-default-features
       - run: cargo test
       - name: e2e (encode → assemble → dav1d decode)
         run: |

@@ -10,4 +10,4 @@ pub mod obu;
 pub mod seq_header;
 pub mod uheader;
 
-mod ffi;
+pub mod ffi;

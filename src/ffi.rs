@@ -36,8 +36,12 @@ pub extern "C" fn stillcast_last_error() -> *const std::ffi::c_char {
 /// Returns a malloc'd buffer of `*out_len` bytes (free with
 /// `stillcast_free`), or NULL on error (see `stillcast_last_error`).
 /// `fps == 0` keeps the input timebase; `gop_size` must be >= 2.
+///
+/// # Safety
+/// `input` must point to `input_len` readable bytes and `out_len` must be
+/// a valid writable pointer.
 #[no_mangle]
-pub extern "C" fn stillcast_expand(
+pub unsafe extern "C" fn stillcast_expand(
     input: *const u8,
     input_len: usize,
     fps: u32,
@@ -47,13 +51,13 @@ pub extern "C" fn stillcast_expand(
     out_len: *mut usize,
 ) -> *mut u8 {
     if !out_len.is_null() {
-        unsafe { *out_len = 0 };
+        *out_len = 0;
     }
     if input.is_null() || out_len.is_null() {
         set_last_error(Some("null pointer argument".into()));
         return ptr::null_mut();
     }
-    let data = unsafe { slice::from_raw_parts(input, input_len) };
+    let data = slice::from_raw_parts(input, input_len);
     let params = ExpandParams {
         fps: (fps > 0).then_some(fps),
         total_frames,
@@ -62,7 +66,7 @@ pub extern "C" fn stillcast_expand(
     };
     match catch_unwind(AssertUnwindSafe(|| expand_ivf(data, &params))) {
         Ok(Ok(bytes)) => {
-            unsafe { *out_len = bytes.len() };
+            *out_len = bytes.len();
             let mut b = bytes.into_boxed_slice();
             let p = b.as_mut_ptr();
             std::mem::forget(b);
@@ -89,5 +93,18 @@ pub extern "C" fn stillcast_expand(
 pub unsafe extern "C" fn stillcast_free(p: *mut u8, len: usize) {
     if !p.is_null() {
         drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_input_errors() {
+        let mut n = 7usize;
+        assert!(unsafe { stillcast_expand(ptr::null(), 4, 0, 10, 10, false, &mut n) }.is_null());
+        assert_eq!(n, 0);
+        assert!(!stillcast_last_error().is_null());
     }
 }
