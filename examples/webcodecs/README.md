@@ -17,8 +17,11 @@ What it does, per `docs/input-contract.md`:
    leading bits) to find:
    - the **anchor TU** — first chunk containing a `SEQUENCE_HEADER` OBU plus
      a shown `KEY_FRAME`;
-   - the **golden TU** — first chunk after it containing a shown non-key
-     coded frame.
+   - the **golden TU** — the first TU after the anchor that contains a
+     coded frame, required to be shown and non-key. It must be decodable
+     directly after the anchor; skipping past a hidden coded frame would
+     let it reference decoder state the anchor never produced (its
+     `ref_frame_idx` could point at the hidden frame's slot).
    The scan exists because `expand`'s `split_input` is positional today
    (packet 0 = anchor, packet 1 = golden); the page reorders chunks as
    `[anchor, golden, ...rest in encode order]` instead of assuming packet 1

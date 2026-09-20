@@ -23,7 +23,7 @@
 <p>
   Encodes ~1 s of a still image with <code>VideoEncoder(av01.*)</code>, scans the
   produced temporal units for an <b>anchor</b> (sequence header + shown KEY_FRAME)
-  and a <b>golden</b> (first shown non-key frame coded after it), then writes an
+  and a <b>golden</b> (the first coded frame after it, required shown non-key), then writes an
   IVF ordered <code>[anchor, golden, ...rest]</code> — the positional shape
   <code>stillcast expand</code> consumes. See <code>docs/input-contract.md</code>.
 </p>
