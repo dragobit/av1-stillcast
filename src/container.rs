@@ -94,7 +94,14 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
     for (i, tu) in tus.iter().enumerate() {
         let obus = parse_obus(tu).with_context(|| format!("TU {i}: bad OBU framing"))?;
         let mut out = Vec::with_capacity(tu.len());
-        for obu in &obus {
+        for (j, obu) in obus.iter().enumerate() {
+            // A TemporalDelimiter only marks a temporal-unit boundary: it is
+            // meaningful solely as a TU's first OBU. Drop deeper ones so
+            // normalized TUs stay spec-valid even when a container-level TU
+            // (IVF packet, Annex-B unit) carries a stray delimiter.
+            if obu.obu_type == ObuType::TemporalDelimiter && j > 0 {
+                continue;
+            }
             obu.write(&mut out);
             if seq_header_found.is_none() && obu.obu_type == ObuType::SequenceHeader {
                 seq_header_found = Some(
@@ -264,31 +271,57 @@ fn split_obu_stream(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     // A TU group with no coded frame (e.g. a standalone seq header before
     // the first TD) belongs to the following TU; a trailing frameless group
     // attaches to the last real TU.
-    let mut merged: Vec<Vec<u8>> = Vec::new();
-    let mut pending: Vec<u8> = Vec::new();
+    let mut merged: Vec<Vec<Obu>> = Vec::new();
+    let mut pending: Vec<Obu> = Vec::new();
     for tu in tus {
-        let has_frame = parse_obus(&tu)?
+        let obus = parse_obus(&tu)?;
+        let has_frame = obus
             .iter()
             .any(|o| matches!(o.obu_type, ObuType::Frame | ObuType::FrameHeader));
         if has_frame {
-            if pending.is_empty() {
-                merged.push(tu);
-            } else {
-                let mut t = std::mem::take(&mut pending);
-                t.extend_from_slice(&tu);
-                merged.push(t);
-            }
+            merged.push(concat_tu(std::mem::take(&mut pending), obus));
         } else {
-            pending.extend_from_slice(&tu);
+            pending.extend(obus);
         }
     }
     if !pending.is_empty() {
         match merged.last_mut() {
-            Some(last) => last.extend_from_slice(&pending),
+            Some(last) => *last = concat_tu(std::mem::take(last), pending),
             None => merged.push(pending),
         }
     }
-    Ok(merged)
+    Ok(merged
+        .iter()
+        .map(|obus| {
+            let mut tu = Vec::new();
+            for obu in obus {
+                obu.write(&mut tu);
+            }
+            tu
+        })
+        .collect())
+}
+
+/// Join two adjacent TU groups into a single temporal unit. A
+/// TemporalDelimiter marks a TU boundary and must be the first OBU of its
+/// TU, so at most one survives: a leading TD of `front` wins, otherwise a
+/// leading TD of `back` is promoted to the front. Any other TD is dropped.
+/// All remaining OBUs keep their order, so a sequence header still precedes
+/// the frame it governs.
+fn concat_tu(front: Vec<Obu>, back: Vec<Obu>) -> Vec<Obu> {
+    let mut td = None;
+    let mut body = Vec::with_capacity(front.len() + back.len());
+    for (i, obu) in front.iter().chain(back.iter()).enumerate() {
+        if obu.obu_type != ObuType::TemporalDelimiter {
+            body.push(obu.clone());
+        } else if (i == 0 || i == front.len()) && td.is_none() {
+            td = Some(obu.clone());
+        }
+    }
+    if let Some(td) = td {
+        body.insert(0, td);
+    }
+    body
 }
 
 /// Split an Annex-B byte stream into temporal units.
@@ -422,6 +455,77 @@ mod tests {
         for (i, pkt) in packets.iter().enumerate() {
             assert_eq!(&input.ivf.frames[i].1, pkt);
         }
+    }
+
+    fn td_count(tu: &[u8]) -> usize {
+        parse_obus(tu)
+            .unwrap()
+            .iter()
+            .filter(|o| o.obu_type == ObuType::TemporalDelimiter)
+            .count()
+    }
+
+    #[test]
+    fn obu_stream_merge_keeps_single_leading_td() {
+        // Layout encoders can emit: a frameless [TD, seq] TU followed by
+        // [TD, KF] [TD, f] ... — merging the frameless group must not leave
+        // the next TU's TemporalDelimiter stranded mid-TU.
+        let packets = ivf_packets();
+        let first = parse_obus(&packets[0]).unwrap();
+        assert_eq!(first[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(first[1].obu_type, ObuType::SequenceHeader);
+
+        let mut stream = Vec::new();
+        first[0].write(&mut stream); // TD
+        first[1].write(&mut stream); // seq header alone in its own TU
+        Obu::temporal_delimiter().write(&mut stream); // fresh TD opens the frame TU
+        for obu in &first[2..] {
+            obu.write(&mut stream);
+        }
+        for pkt in &packets[1..] {
+            stream.extend_from_slice(pkt);
+        }
+
+        // The merge itself must produce a spec-valid TU, not just rely on
+        // finish() dropping the stray delimiter.
+        let tus = split_obu_stream(&stream).unwrap();
+        assert_eq!(tus.len(), packets.len());
+        assert_eq!(td_count(&tus[0]), 1);
+
+        let input = read(&stream).unwrap();
+        assert_eq!(input.ivf.frames.len(), packets.len());
+        let obus0 = parse_obus(&input.ivf.frames[0].1).unwrap();
+        assert_eq!(td_count(&input.ivf.frames[0].1), 1);
+        // TD is first; the sequence header still precedes the frame it governs.
+        assert_eq!(obus0[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(obus0[1].obu_type, ObuType::SequenceHeader);
+        assert!(obus0.iter().any(|o| o.obu_type == ObuType::Frame));
+    }
+
+    #[test]
+    fn obu_stream_trailing_frameless_tu_keeps_single_leading_td() {
+        // A trailing [TD, metadata] group merges into the last frame TU;
+        // its delimiter must not end up mid-TU either.
+        let packets = ivf_packets();
+        let mut stream = write_obu_stream(&packets);
+        Obu::temporal_delimiter().write(&mut stream);
+        Obu {
+            obu_type: ObuType::Metadata,
+            extension: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
+        }
+        .write(&mut stream);
+
+        let tus = split_obu_stream(&stream).unwrap();
+        assert_eq!(tus.len(), packets.len());
+        assert_eq!(td_count(tus.last().unwrap()), 1);
+
+        let input = read(&stream).unwrap();
+        assert_eq!(input.ivf.frames.len(), packets.len());
+        let last = parse_obus(&input.ivf.frames.last().unwrap().1).unwrap();
+        assert_eq!(td_count(&input.ivf.frames.last().unwrap().1), 1);
+        assert_eq!(last.first().unwrap().obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(last.last().unwrap().obu_type, ObuType::Metadata);
     }
 
     #[test]
