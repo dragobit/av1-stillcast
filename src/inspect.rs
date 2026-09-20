@@ -96,7 +96,10 @@ fn inter_ref_slots(payload: &[u8], sh: &SequenceHeader) -> Result<[u8; 7]> {
     if allow_sct && sh.seq_force_integer_mv == 2 {
         r.f(1)?; // force_integer_mv
     }
-    r.f(1)?; // frame_size_override_flag (SWITCH_FRAME excluded above? keep for ft!=3)
+    // frame_size_override_flag is uncoded for SWITCH_FRAME (forced to 1).
+    if ft != 3 {
+        r.f(1)?; // frame_size_override_flag
+    }
     r.f(sh.order_hint_bits)?; // order_hint
     if !er {
         r.f(3)?; // primary_ref_frame
@@ -109,11 +112,13 @@ fn inter_ref_slots(payload: &[u8], sh: &SequenceHeader) -> Result<[u8; 7]> {
             }
         }
     }
-    let refresh = if ft == 3 { 0xff } else { r.f(8)? };
-    let _ = refresh;
-    // (frame_is_intra || refresh==0xff) is false here unless refresh==0xff;
-    // handle error_resilient ref_order_hints
-    if er && sh.enable_order_hint && refresh != 0xff {
+    if ft != 3 {
+        r.f(8)?; // refresh_frame_flags (forced 0xff for SWITCH_FRAME)
+    }
+    // ref_order_hint is coded whenever
+    // (!frame_is_intra || refresh_frame_flags != 0xff) && error_resilient &&
+    // enable_order_hint — every frame reaching here is non-intra.
+    if er && sh.enable_order_hint {
         for _ in 0..8 {
             r.f(sh.order_hint_bits)?;
         }
@@ -348,5 +353,85 @@ pub fn describe_kind(k: &TuKind) -> String {
             slot,
             if *slot_was_key { "KEY_FRAME" } else { "inter" }
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitio::BitWriter;
+
+    fn test_seq_header() -> SequenceHeader {
+        SequenceHeader {
+            enable_order_hint: true,
+            order_hint_bits: 8,
+            seq_force_screen_content_tools: 0,
+            seq_force_integer_mv: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Encode the uncompressed-header fields `inter_ref_slots` walks for a
+    /// shown non-intra frame: SWITCH_FRAME omits error_resilient,
+    /// frame_size_override_flag and refresh_frame_flags (all forced).
+    fn encode_header(frame_type: u8, error_resilient: bool, refs: [u8; 7]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.f(1, 0); // show_existing_frame
+        w.f(2, u64::from(frame_type));
+        w.f(1, 1); // show_frame (showable_frame uncoded)
+        let er = frame_type == 3 || error_resilient;
+        if frame_type != 3 {
+            w.f(1, u64::from(er));
+        }
+        w.f(1, 1); // disable_cdf_update
+        if frame_type != 3 {
+            w.f(1, 1); // frame_size_override_flag
+        }
+        w.f(8, 5); // order_hint
+        if !er {
+            w.f(3, 0); // primary_ref_frame
+        }
+        // no decoder_model_info; refresh_frame_flags
+        if frame_type != 3 {
+            w.f(8, 0xff);
+        }
+        // non-intra + error_resilient + enable_order_hint → ref_order_hints
+        if er {
+            for i in 0..8u64 {
+                w.f(8, 10 + i);
+            }
+        }
+        w.f(1, 0); // frame_refs_short_signaling
+        for &s in &refs {
+            w.f(3, u64::from(s));
+        }
+        w.trailing_bits();
+        w.into_bytes()
+    }
+
+    #[test]
+    fn inter_refs_switch_frame() {
+        // er forced, refresh forced 0xff: ref_order_hints are still coded.
+        let sh = test_seq_header();
+        let refs = [3, 4, 5, 6, 0, 1, 2];
+        let payload = encode_header(3, false, refs);
+        assert_eq!(inter_ref_slots(&payload, &sh).unwrap(), refs);
+    }
+
+    #[test]
+    fn inter_refs_error_resilient_full_refresh() {
+        // er INTER with refresh_frame_flags == 0xff: hints still coded.
+        let sh = test_seq_header();
+        let refs = [6, 0, 1, 2, 3, 4, 5];
+        let payload = encode_header(INTER_FRAME, true, refs);
+        assert_eq!(inter_ref_slots(&payload, &sh).unwrap(), refs);
+    }
+
+    #[test]
+    fn inter_refs_non_resilient() {
+        let sh = test_seq_header();
+        let refs = [0, 1, 2, 3, 4, 5, 6];
+        let payload = encode_header(INTER_FRAME, false, refs);
+        assert_eq!(inter_ref_slots(&payload, &sh).unwrap(), refs);
     }
 }
