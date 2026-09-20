@@ -4,7 +4,9 @@
  * Encodes N identical frames of a still image with VideoEncoder(av01.*),
  * then picks the two temporal units `stillcast expand` needs positionally:
  *   IVF packet 0 = anchor TU (sequence header OBU + shown KEY_FRAME)
- *   IVF packet 1 = golden TU (first shown non-key frame coded after the anchor)
+ *   IVF packet 1 = golden TU (the first TU coded after the anchor — must be
+ *                  a shown non-key frame; skipping intervening hidden frames
+ *                  would let it reference decoder state the anchor lacks)
  * The remaining chunks follow in encoder order so `stillcast info --verbose`
  * shows the whole acquired stream.
  */
@@ -211,9 +213,20 @@ function analyze({ cfg, chunks, metas }, o) {
     if (!got.has(t)) missing.push(i);
   }
 
-  // Positional contract: packet 0 = anchor, packet 1 = golden.
+  // Positional contract: packet 0 = anchor, packet 1 = golden. The golden
+  // must be decodable directly after the anchor, so it must be the FIRST TU
+  // after it containing a coded frame — TUs without coded frames (TD-only,
+  // metadata, show_existing) don't touch the DPB and may sit in between.
+  // Skipping past a hidden or key coded frame would risk picking a golden
+  // that references state the anchor never produced.
   const anchor = chunks.findIndex(tuIsAnchor);
-  const golden = anchor < 0 ? -1 : chunks.findIndex((c, i) => i > anchor && tuIsGolden(c));
+  let golden = -1;
+  for (let i = anchor + 1; anchor >= 0 && i < chunks.length; i++) {
+    if (chunks[i].scan.frames.some(f => f.kind === 'CODED')) {
+      golden = tuIsGolden(chunks[i]) ? i : -1;
+      break;
+    }
+  }
 
   const order = [];
   if (anchor >= 0) order.push(anchor);
@@ -245,9 +258,18 @@ function renderTable(chunks, picks) {
   $('chunks').hidden = false;
 }
 
+let lastBlobUrl = null;
+function resetDownload() {
+  const a = $('download');
+  if (lastBlobUrl) { URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = null; }
+  a.removeAttribute('href');
+  a.textContent = '';
+}
+
 async function run(opts) {
   const o = Object.assign(readConfig(), opts || {});
   const canvas = $('src');
+  resetDownload();
   log(`encode: ${o.nFrames}f ${canvas.width}x${canvas.height}@${o.fps} ` +
       `${o.codec} latency=${o.latencyMode} hw=${o.hardwareAcceleration} ` +
       `bitrateMode=${o.bitrateMode} bitrate=${o.bitrate}` +
@@ -270,6 +292,7 @@ async function run(opts) {
   renderTable(chunks, picks);
 
   if (picks.anchor < 0 || picks.golden < 0) {
+    resetDownload();
     $('summary').innerHTML = '<b class="bad">contract unsatisfied — no IVF written</b>';
     return { ok: false, error: 'no anchor or golden TU', chunks: chunkReport(chunks, picks) };
   }
@@ -279,7 +302,8 @@ async function run(opts) {
     `<b class="ok">IVF: ${ivf.byteLength} B, ${chunks.length} packets ` +
     `(order ${picks.order.join(',')})</b>`;
   const a = $('download');
-  a.href = URL.createObjectURL(new Blob([ivf], { type: 'application/octet-stream' }));
+  lastBlobUrl = URL.createObjectURL(new Blob([ivf], { type: 'application/octet-stream' }));
+  a.href = lastBlobUrl;
   a.download = 'webcodecs-src.ivf';
   a.textContent = `⇩ webcodecs-src.ivf (${ivf.byteLength} B)`;
 
