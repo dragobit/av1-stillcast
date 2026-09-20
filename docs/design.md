@@ -87,6 +87,7 @@ model across segments in decode order.
 | `seq_header` | full sequence-header walk → flags needed downstream |
 | `frame_header` | partial uncompressed-header parse (stops after refresh_frame_flags) |
 | `ivf` | IVF container read/write (packets = temporal units) |
+| `container` | input sniffing/demux: IVF + low-overhead OBU + Annex-B → `IvfFile` (see `docs/input-formats.md`) |
 | `mp4` | ISOBMFF writer: ftyp+mdat+moov, av01/av1C + mp4a/esds, stss |
 | `adts` | ADTS parser → raw AAC frames + AudioSpecificConfig |
 | `api` | stable crate API: bytes-in→bytes-out `expand_ivf*` |
@@ -96,11 +97,14 @@ model across segments in decode order.
 
 ## Input contract
 
-Input IVF must contain ≥2 packets produced by a conformant encoder for the
-same static picture: packet 0 = seq header + shown keyframe; packet 1 = the
+Input must contain ≥2 temporal units produced by a conformant encoder for
+the same static picture: TU 0 = seq header + shown keyframe; TU 1 = the
 golden (a shown inter frame is what libaom emits for identical content).
-Rejected up front: reduced still-picture headers, frame id numbers,
-unequal-interval decoder-model timing, film grain.
+Accepted containers: IVF, low-overhead OBU stream, Annex-B — sniffed by
+content, no ffmpeg involvement (see `docs/input-formats.md` for why mp4/mkv
+are deliberately excluded). Rejected up front: reduced still-picture
+headers, frame id numbers, unequal-interval decoder-model timing, film
+grain.
 
 ## MP4 output
 
