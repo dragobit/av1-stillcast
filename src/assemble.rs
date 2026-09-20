@@ -17,8 +17,14 @@ use crate::uheader;
 
 /// Parameters controlling the assembled stream.
 pub struct AssembleParams {
-    /// Output frame rate (also used for IVF timestamps when input has none).
+    /// Output frame rate numerator (time_scale in the emitted timing_info;
+    /// also used for IVF timestamps when the input has none). The effective
+    /// rate is `fps`/`fps_den` frames per second.
     pub fps: u32,
+    /// Output frame rate denominator (num_units_in_display_tick in the
+    /// emitted timing_info). 0 is treated as 1, so `fps = 30000`,
+    /// `fps_den = 1001` describes NTSC 29.97 exactly.
+    pub fps_den: u32,
     /// Total output frames.
     pub total_frames: u64,
     /// Frames per GOP (distance between keyframes). Controls seek granularity.
@@ -221,10 +227,10 @@ pub fn assemble_multi(segments: &[Segment], params: &AssembleParams) -> Result<A
     let rewrite_ctx: Option<(SequenceHeader, Vec<u8>)> =
         if params.decoder_model || !sh.timing_info_present {
             let sh2 = if params.decoder_model {
-                seq_header::with_decoder_model(&sh, params.fps.max(1))
+                seq_header::with_decoder_model_rate(&sh, params.fps.max(1), params.fps_den.max(1))
                     .context("decoder model injection")?
             } else {
-                seq_header::with_timing_info(&sh, params.fps.max(1))
+                seq_header::with_timing_info_rate(&sh, params.fps.max(1), params.fps_den.max(1))
             };
             let payload = seq_header::emit_sequence_header(&sh2);
             Some((sh2, payload))
@@ -352,10 +358,12 @@ pub fn assemble_multi(segments: &[Segment], params: &AssembleParams) -> Result<A
 }
 
 /// Build an IVF from assembled TUs, preserving geometry and timebase.
+/// `fps` is an explicit integer-rate override (`(fps, 1)`); otherwise the
+/// source's timebase is kept verbatim — never a zero-rate pair.
 pub fn to_ivf(src: &IvfFile, tus: Vec<TemporalUnit>, fps: Option<u32>) -> IvfFile {
     let (den, num) = match fps {
-        Some(f) => (f, 1),
-        None => (src.timebase_den, src.timebase_num),
+        Some(f) if f > 0 => (f, 1),
+        _ => src.rate(),
     };
     IvfFile {
         width: src.width,
@@ -1082,6 +1090,7 @@ mod tests {
         let src = src_tus();
         let params = AssembleParams {
             fps: 30,
+            fps_den: 1,
             total_frames: 8,
             gop_size: 8,
             decoder_model: true,

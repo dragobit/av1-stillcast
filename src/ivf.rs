@@ -13,14 +13,54 @@ pub struct IvfFile {
     pub frames: Vec<(u64, Vec<u8>)>,
 }
 
+/// Greatest common divisor (Euclid).
+pub(crate) fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+impl IvfFile {
+    /// Frame rate as a reduced rational `(num, den)` in frames/second
+    /// (e.g. `(30000, 1001)` for NTSC). IVF stores it directly as
+    /// `timebase_den`/`timebase_num`; a zero in either field means the
+    /// muxer didn't know the rate — treated as unset, defaulting to
+    /// 30/1.
+    pub fn rate(&self) -> (u32, u32) {
+        if self.timebase_den == 0 || self.timebase_num == 0 {
+            return (30, 1);
+        }
+        let g = gcd(u64::from(self.timebase_den), u64::from(self.timebase_num));
+        (
+            (u64::from(self.timebase_den) / g) as u32,
+            (u64::from(self.timebase_num) / g) as u32,
+        )
+    }
+
+    /// Frame rate as frames per second (`rate().0 / rate().1`).
+    pub fn fps(&self) -> f64 {
+        let (num, den) = self.rate();
+        f64::from(num) / f64::from(den)
+    }
+}
+
 pub fn read(data: &[u8]) -> Result<IvfFile> {
     anyhow::ensure!(data.len() >= 32, "IVF header truncated");
     anyhow::ensure!(&data[0..4] == b"DKIF", "not an IVF file");
     anyhow::ensure!(&data[8..12] == b"AV01", "IVF fourcc is not AV01");
     let width = u16::from_le_bytes(data[12..14].try_into().unwrap());
     let height = u16::from_le_bytes(data[14..16].try_into().unwrap());
-    let timebase_den = u32::from_le_bytes(data[16..20].try_into().unwrap());
-    let timebase_num = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let den = u32::from_le_bytes(data[16..20].try_into().unwrap());
+    let num = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    // A zero in either field means the muxer didn't know the rate —
+    // normalize to the unset default so downstream never sees a
+    // zero-rate timebase.
+    let (timebase_den, timebase_num) = if den == 0 || num == 0 {
+        (30, 1)
+    } else {
+        (den, num)
+    };
 
     let mut frames = Vec::new();
     let mut off = 32usize;

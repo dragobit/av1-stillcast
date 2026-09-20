@@ -132,7 +132,10 @@ cleanly). The video track carries an `av01` sample entry whose `av1C` box
 is derived from the parsed sequence header; keyframes land in `stss`, so
 seek granularity = gop. The audio track takes an ADTS file, strips the
 7-byte headers into `mp4a` samples, and writes `esds` with the
-AudioSpecificConfig. Timescales: video = fps, audio = sample rate; all
+AudioSpecificConfig. Timescales: video = the rate numerator with
+`sample_delta` = its denominator (30000/1001 for an NTSC source — the
+input's rational timebase is preserved end-to-end, not truncated to an
+integer fps), audio = sample rate; all
 creation/modification times are zeroed to keep output byte-deterministic.
 
 ## What is deliberately not done

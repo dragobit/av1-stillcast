@@ -231,6 +231,51 @@ fn expand_rejects_all_keyframe_input() {
 }
 
 #[test]
+fn expand_treats_zero_timebase_as_unset() {
+    // Muxers that don't know the rate write timebase 0/0; it must fall
+    // back to 30/1 and the output IVF must never carry a zero-rate pair.
+    let mut src = ivf::read(SRC).unwrap();
+    src.timebase_den = 0;
+    src.timebase_num = 0;
+    let input = ivf::write(&src);
+    let out = expand_ivf(
+        &input,
+        &ExpandParams {
+            fps: None,
+            total_frames: 10,
+            gop_size: 10,
+            decoder_model: false,
+        },
+    )
+    .unwrap();
+    let out_ivf = ivf::read(&out).unwrap();
+    assert_eq!(out_ivf.rate(), (30, 1));
+    assert_eq!((out_ivf.timebase_den, out_ivf.timebase_num), (30, 1));
+
+    // An OBU stream built from the same TUs goes through
+    // container::finish's path and must land on the same default when the
+    // sequence header declares no usable timing.
+    let packets: Vec<Vec<u8>> = ivf::read(SRC)
+        .unwrap()
+        .frames
+        .into_iter()
+        .map(|(_, tu)| tu)
+        .collect();
+    let obu_stream = stillcast::container::write_obu_stream(&packets);
+    let out = expand_ivf(
+        &obu_stream,
+        &ExpandParams {
+            fps: None,
+            total_frames: 10,
+            gop_size: 10,
+            decoder_model: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(ivf::read(&out).unwrap().rate(), (30, 1));
+}
+
+#[test]
 fn expand_ivf_rejects_garbage() {
     assert!(expand_ivf(
         b"not ivf",

@@ -43,9 +43,12 @@ every encoder can emit an elementary stream, while mp4's strengths
   following TU. OBUs are re-serialized with explicit size fields.
 - Annex-B: `temporal_unit_size`/`frame_unit_size`/`obu_size` leb128 nesting
   unwrapped; OBU headers re-framed.
-- Non-IVF inputs have no container timebase: fps comes from the sequence
-  header's `timing_info` when present, else 30 — `expand` prints a note and
-  `--fps` overrides.
+- Non-IVF inputs have no container timebase: the rate comes from the
+  sequence header's `timing_info` when present — kept as an exact
+  rational (`time_scale` / frame period, so 30000/1001 stays 30000/1001,
+  not a truncated 29) — else 30/1. `expand` prints a note and `--fps`
+  overrides. IVF inputs with a zero in either timebase field are treated
+  as unset (30/1) the same way, and output never carries a zero rate.
 - `stillcast info` additionally accepts mp4/other containers by demuxing
   through ffmpeg (pre-existing path), unchanged.
 - `expand_ivf`/`expand_ivf_multi` now sniff the input format themselves, so

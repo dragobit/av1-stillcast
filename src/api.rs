@@ -12,7 +12,8 @@ use crate::ivf;
 
 /// Parameters for [`expand_ivf`] / [`expand_ivf_multi`].
 pub struct ExpandParams {
-    /// Output frame rate. `None` keeps the input IVF timebase.
+    /// Output frame rate. `None` (or 0) keeps the input timebase — the
+    /// exact rational, e.g. 30000/1001 for NTSC sources.
     pub fps: Option<u32>,
     /// Total output frame count.
     pub total_frames: u64,
@@ -82,17 +83,16 @@ pub fn expand_ivf_multi(segments: &[SegmentInput], params: &ExpandParams) -> Res
         })
         .collect();
 
-    let eff_fps = params.fps.unwrap_or_else(|| {
-        donor
-            .timebase_den
-            .checked_div(donor.timebase_num.max(1))
-            .unwrap_or(30)
-            .max(1)
-    });
+    let (rate_num, rate_den) = params
+        .fps
+        .filter(|&f| f > 0)
+        .map(|f| (f, 1))
+        .unwrap_or_else(|| donor.rate());
     let out = assemble::assemble_multi(
         &segs,
         &AssembleParams {
-            fps: eff_fps,
+            fps: rate_num,
+            fps_den: rate_den,
             total_frames: segs.iter().map(|s| s.frames).sum(),
             gop_size: params.gop_size,
             decoder_model: params.decoder_model,
