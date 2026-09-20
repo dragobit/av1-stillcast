@@ -220,35 +220,50 @@ fn tables(samples: &[Sample], sample_delta: u32, sync: Option<&[u32]>) -> TrackT
     }
 }
 
-fn mvhd(duration_ms: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(100);
-    p.extend_from_slice(&u32be(0)); // creation/modification epoch (deterministic)
-    p.extend_from_slice(&u32be(0));
+fn mvhd(duration_ms: u64) -> Vec<u8> {
+    // Version 1 carries a 64-bit duration (and creation/modification
+    // times); required once the movie length exceeds u32::MAX ms
+    // (~49.7 days).
+    let v1 = duration_ms > u64::from(u32::MAX);
+    let mut p = Vec::with_capacity(112);
+    if v1 {
+        p.extend_from_slice(&[0u8; 16]); // u64 creation + modification
+    } else {
+        p.extend_from_slice(&[0u8; 8]); // u32 creation + modification
+    }
     p.extend_from_slice(&u32be(1000)); // timescale
-    p.extend_from_slice(&u32be(duration_ms));
+    if v1 {
+        p.extend_from_slice(&duration_ms.to_be_bytes());
+    } else {
+        p.extend_from_slice(&u32be(duration_ms as u32));
+    }
     p.extend_from_slice(&u32be(0x0001_0000)); // rate 1.0
     p.extend_from_slice(&u16be(0x0100)); // volume 1.0
     p.extend_from_slice(&[0u8; 10]); // reserved
                                      // identity matrix
-    for (i, v) in [0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000]
-        .iter()
-        .enumerate()
-    {
-        let _ = i;
-        p.extend_from_slice(&u32be(*v));
+    for v in [0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+        p.extend_from_slice(&u32be(v));
     }
     p.extend_from_slice(&[0u8; 24]); // pre_defined
     p.extend_from_slice(&u32be(3)); // next_track_id
-    full_box(b"mvhd", 0, 0, &p)
+    full_box(b"mvhd", u8::from(v1), 0, &p)
 }
 
-fn tkhd(track_id: u32, duration_ms: u32, w: u32, h: u32, volume: u16) -> Vec<u8> {
-    let mut p = Vec::with_capacity(84);
-    p.extend_from_slice(&u32be(0)); // creation/modification
-    p.extend_from_slice(&u32be(0));
+fn tkhd(track_id: u32, duration_ms: u64, w: u32, h: u32, volume: u16) -> Vec<u8> {
+    let v1 = duration_ms > u64::from(u32::MAX);
+    let mut p = Vec::with_capacity(96);
+    if v1 {
+        p.extend_from_slice(&[0u8; 16]); // u64 creation + modification
+    } else {
+        p.extend_from_slice(&[0u8; 8]); // u32 creation + modification
+    }
     p.extend_from_slice(&u32be(track_id));
     p.extend_from_slice(&u32be(0)); // reserved
-    p.extend_from_slice(&u32be(duration_ms));
+    if v1 {
+        p.extend_from_slice(&duration_ms.to_be_bytes());
+    } else {
+        p.extend_from_slice(&u32be(duration_ms as u32));
+    }
     p.extend_from_slice(&[0u8; 8]); // reserved
     p.extend_from_slice(&u16be(0)); // layer
     p.extend_from_slice(&u16be(0)); // alternate_group
@@ -259,18 +274,29 @@ fn tkhd(track_id: u32, duration_ms: u32, w: u32, h: u32, volume: u16) -> Vec<u8>
     }
     p.extend_from_slice(&u32be(w << 16));
     p.extend_from_slice(&u32be(h << 16));
-    full_box(b"tkhd", 0, 3, &p) // enabled | in_movie
+    full_box(b"tkhd", u8::from(v1), 3, &p) // enabled | in_movie
 }
 
 fn mdhd(timescale: u32, duration: u64, language: Option<&str>) -> Vec<u8> {
-    let mut p = Vec::with_capacity(24);
-    p.extend_from_slice(&u32be(0));
-    p.extend_from_slice(&u32be(0));
+    // Version 1 carries a 64-bit duration; required once the media length
+    // exceeds u32::MAX ticks — e.g. ~40 h of video at a rational
+    // timescale of 30000 with delta 1001 (or ~27 h of AAC at 1024/sample).
+    let v1 = duration > u64::from(u32::MAX);
+    let mut p = Vec::with_capacity(36);
+    if v1 {
+        p.extend_from_slice(&[0u8; 16]); // u64 creation + modification
+    } else {
+        p.extend_from_slice(&[0u8; 8]); // u32 creation + modification
+    }
     p.extend_from_slice(&u32be(timescale));
-    p.extend_from_slice(&u32be(duration as u32));
+    if v1 {
+        p.extend_from_slice(&duration.to_be_bytes());
+    } else {
+        p.extend_from_slice(&u32be(duration as u32));
+    }
     p.extend_from_slice(&u16be(language.map(lang_bits).unwrap_or(0x55c4)));
     p.extend_from_slice(&u16be(0));
-    full_box(b"mdhd", 0, 0, &p)
+    full_box(b"mdhd", u8::from(v1), 0, &p)
 }
 
 fn hdlr(handler: &[u8; 4], name: &str) -> Vec<u8> {
@@ -337,7 +363,7 @@ fn minf_audio(stbl: &[u8]) -> Vec<u8> {
     bx(b"minf", &m)
 }
 
-fn trak(track_id: u32, duration_ms: u32, tkhd_wh: (u32, u32), volume: u16, mdia: &[u8]) -> Vec<u8> {
+fn trak(track_id: u32, duration_ms: u64, tkhd_wh: (u32, u32), volume: u16, mdia: &[u8]) -> Vec<u8> {
     let mut t = Vec::new();
     t.extend_from_slice(&tkhd(track_id, duration_ms, tkhd_wh.0, tkhd_wh.1, volume));
     t.extend_from_slice(mdia);
@@ -432,13 +458,14 @@ pub fn write(
         }
     }
 
-    // duration bookkeeping
+    // duration bookkeeping (u64 all the way to the box boundary — version-0
+    // boxes take u32 durations, so long media needs version 1)
     let v_media_dur = u64::from(video.sample_delta) * video.samples.len() as u64;
-    let v_dur_ms = (v_media_dur * 1000 / u64::from(video.timescale)) as u32;
+    let v_dur_ms = v_media_dur * 1000 / u64::from(video.timescale);
     let (a_media_dur, a_dur_ms) = match audio {
         Some(a) => {
             let d = u64::from(a.sample_delta) * a.samples.len() as u64;
-            (d, (d * 1000 / u64::from(a.sample_rate)) as u32)
+            (d, d * 1000 / u64::from(a.sample_rate))
         }
         None => (0, 0),
     };
@@ -515,5 +542,33 @@ mod tests {
     fn box_sizes() {
         let b = bx(b"free", &[1, 2, 3]);
         assert_eq!(&b[..8], &[0, 0, 0, 11, b'f', b'r', b'e', b'e']);
+    }
+
+    #[test]
+    fn mdhd_switches_to_version_1_on_long_durations() {
+        // v0: 32-bit duration.
+        let b = mdhd(30000, 120, None);
+        assert_eq!(b[8], 0); // version
+        assert_eq!(
+            u32::from_be_bytes(b[24..28].try_into().unwrap()),
+            120,
+            "v0 duration"
+        );
+
+        // v1: 64-bit duration once ticks exceed u32::MAX — a 30000/1001
+        // stream (~1001 ticks/sample) crosses this near 40 h.
+        let dur = 6_500_000_000u64;
+        let b = mdhd(30000, dur, None);
+        assert_eq!(b[8], 1);
+        assert_eq!(
+            u64::from_be_bytes(b[32..40].try_into().unwrap()),
+            dur,
+            "v1 duration"
+        );
+        assert_eq!(
+            u32::from_be_bytes(b[28..32].try_into().unwrap()),
+            30000,
+            "timescale stays u32"
+        );
     }
 }
