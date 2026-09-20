@@ -167,9 +167,9 @@ enum Cmd {
     },
 }
 
-fn resolve_gop(gop: u64, target_seek: Option<f64>, fps: u32) -> u64 {
+fn resolve_gop(gop: u64, target_seek: Option<f64>, fps: f64) -> u64 {
     match target_seek {
-        Some(s) => (s * f64::from(fps)).round().max(2.0) as u64,
+        Some(s) => (s * fps).round().max(2.0) as u64,
         None => gop,
     }
 }
@@ -372,9 +372,9 @@ fn read_playlist(path: &Path) -> Result<Vec<PlaylistEntry>> {
 fn segment_frames(
     entries: &[PlaylistEntry],
     total_secs: Option<f64>,
-    fps: u32,
+    fps: f64,
 ) -> Result<Vec<u64>> {
-    let total_frames = total_secs.map(|t| (t * f64::from(fps)).round() as u64);
+    let total_frames = total_secs.map(|t| (t * fps).round() as u64);
     let mut frames = Vec::with_capacity(entries.len());
     let mut used = 0u64;
     for (i, e) in entries.iter().enumerate() {
@@ -384,7 +384,7 @@ fn segment_frames(
                 used += n.max(1);
             }
             Some(SegmentDur::Seconds(s)) => {
-                let n = (s * f64::from(fps)).round().max(1.0) as u64;
+                let n = (s * fps).round().max(1.0) as u64;
                 frames.push(n);
                 used += n;
             }
@@ -407,7 +407,7 @@ fn segment_frames(
 /// Build the output file bytes in memory (ivf or mp4) without writing.
 /// `donor` supplies geometry/timebase (segment 0's IVF); `pairs` are the
 /// per-segment (key TU, golden TU) pairs; `seg_frames` are segment lengths.
-/// Returns (bytes, n_samples, golden_slot, eff_fps, total_frames).
+/// Returns (bytes, n_samples, golden_slot, total_frames).
 #[allow(clippy::too_many_arguments)]
 fn build_output(
     donor: &stillcast::ivf::IvfFile,
@@ -423,14 +423,14 @@ fn build_output(
     audio_lang: Option<&str>,
     meta: Option<&stillcast::mp4::Meta>,
     decoder_model: bool,
-) -> Result<(Vec<u8>, usize, u8, u32, u64)> {
+) -> Result<(Vec<u8>, usize, u8, u64)> {
     let ivf = donor;
-    let eff_fps = fps.unwrap_or_else(|| {
-        ivf.timebase_den
-            .checked_div(ivf.timebase_num.max(1))
-            .unwrap_or(30)
-            .max(1)
-    });
+    // Exact rational rate (num/den fps): --fps N means (N, 1); otherwise
+    // the input's timebase is kept — 30000/1001 stays 30000/1001.
+    let (rate_num, rate_den) = fps
+        .filter(|&f| f > 0)
+        .map(|f| (f, 1))
+        .unwrap_or_else(|| ivf.rate());
     let total: u64 = seg_frames.iter().sum();
     anyhow::ensure!(total >= 2, "need at least 2 output frames");
 
@@ -444,7 +444,8 @@ fn build_output(
         })
         .collect();
     let params = stillcast::assemble::AssembleParams {
-        fps: eff_fps,
+        fps: rate_num,
+        fps_den: rate_den,
         total_frames: total,
         gop_size: gop,
         decoder_model,
@@ -458,13 +459,15 @@ fn build_output(
     }
 
     let bytes = if is_mp4 {
+        // mp4 keeps the exact rate too: timescale/sample_delta = 30000/1001
+        // for NTSC sources instead of a truncated 29/1.
         let vtrack = stillcast::mp4::VideoTrack {
             samples: out.tus.into_iter().map(stillcast::mp4::Sample).collect(),
             sync_samples: out.key_samples,
             width: ivf.width,
             height: ivf.height,
-            timescale: eff_fps,
-            sample_delta: 1,
+            timescale: rate_num,
+            sample_delta: rate_den,
             av1c: stillcast::mp4::build_av1c(&out.seq_header, &out.seq_header_obu),
         };
         let atrack = match audio {
@@ -499,7 +502,7 @@ fn build_output(
         let out_ivf = stillcast::assemble::to_ivf(ivf, out.tus, fps);
         stillcast::ivf::write(&out_ivf)
     };
-    Ok((bytes, n_samples, golden_slot, eff_fps, total))
+    Ok((bytes, n_samples, golden_slot, total))
 }
 
 fn write_output(
@@ -711,7 +714,7 @@ fn fit_gop_for_size(
 ) -> Result<(Vec<u8>, usize, u8, u64, bool)> {
     let mut g = gop.max(2);
     loop {
-        let (bytes, n, slot, _fps, total) = build_output(
+        let (bytes, n, slot, total) = build_output(
             donor,
             pairs,
             seg_frames,
@@ -797,8 +800,8 @@ fn main() -> Result<()> {
                 ),
                 (None, None) => None,
             };
-            let seg_frames = segment_frames(&entries, total_secs, fps)?;
-            let gop = resolve_gop(gop, target_seek, fps);
+            let seg_frames = segment_frames(&entries, total_secs, f64::from(fps))?;
+            let gop = resolve_gop(gop, target_seek, f64::from(fps));
 
             // CRF ladder when a size budget is given: first fit wins.
             let mut crfs = vec![crf];
@@ -832,7 +835,7 @@ fn main() -> Result<()> {
                     meta.as_ref(),
                     decoder_model,
                 ) {
-                    Ok((bytes, n, slot, _, _)) => {
+                    Ok((bytes, n, slot, _)) => {
                         let fits = budget.map(|b| bytes.len() as u64 <= b).unwrap_or(true);
                         chosen = Some((bytes, n, slot, *c));
                         if fits {
@@ -892,19 +895,20 @@ fn main() -> Result<()> {
             };
             let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
             let (donor, donor_format, pairs) = load_pairs(&paths)?;
-            let eff_fps = fps.unwrap_or_else(|| {
-                donor
-                    .timebase_den
-                    .checked_div(donor.timebase_num.max(1))
-                    .unwrap_or(30)
-                    .max(1)
-            });
-            if donor_format != stillcast::container::Format::Ivf && fps.is_none() {
+            // Exact rational rate (num/den fps): --fps N means (N, 1);
+            // otherwise the input's timebase, e.g. 30000/1001 for NTSC.
+            let (rate_num, rate_den) = fps
+                .filter(|&f| f > 0)
+                .map(|f| (f, 1))
+                .unwrap_or_else(|| donor.rate());
+            let eff_fps = f64::from(rate_num) / f64::from(rate_den);
+            if donor_format != stillcast::container::Format::Ivf && fps.filter(|&f| f > 0).is_none()
+            {
                 eprintln!(
-                    "note: {:?} input has no container timebase; using {} fps \
-                     (from the sequence header's timing_info, else 30) — \
+                    "note: {:?} input has no container timebase; using {}/{} fps \
+                     (from the sequence header's timing_info, else 30/1) — \
                      pass --fps to override",
-                    donor_format, eff_fps
+                    donor_format, rate_num, rate_den
                 );
             }
             let gop = resolve_gop(gop, target_seek, eff_fps);
@@ -918,7 +922,7 @@ fn main() -> Result<()> {
             // of per-segment playlist durations) gives the length. A trailing
             // playlist entry without a duration fills the remainder.
             let total_secs = match (frames, duration) {
-                (Some(f), _) => Some(f as f64 / f64::from(eff_fps)),
+                (Some(f), _) => Some(f as f64 / eff_fps),
                 (None, d) => d,
             };
             let seg_frames = segment_frames(&entries, total_secs, eff_fps)?;
@@ -969,7 +973,7 @@ fn main() -> Result<()> {
                     write_output(&output, &bytes, n, slot, g)?;
                 }
                 None => {
-                    let (bytes, n, slot, _, _) = build_output(
+                    let (bytes, n, slot, _) = build_output(
                         &donor,
                         &pairs,
                         &seg_frames,
@@ -1033,18 +1037,18 @@ fn main() -> Result<()> {
             let ivf = input_fmt.ivf;
             let (key_tu, golden_tu) =
                 stillcast::assemble::split_input(&ivf).context("splitting input")?;
-            let eff_fps = fps.unwrap_or_else(|| {
-                ivf.timebase_den
-                    .checked_div(ivf.timebase_num.max(1))
-                    .unwrap_or(30)
-                    .max(1)
-            });
+            let (rate_num, rate_den) = fps
+                .filter(|&f| f > 0)
+                .map(|f| (f, 1))
+                .unwrap_or_else(|| ivf.rate());
+            let eff_fps = f64::from(rate_num) / f64::from(rate_den);
             // Measure one show_existing TU to get the per-frame repeat cost.
             let probe = stillcast::assemble::assemble(
                 &key_tu,
                 &golden_tu,
                 &stillcast::assemble::AssembleParams {
-                    fps: eff_fps,
+                    fps: rate_num,
+                    fps_den: rate_den,
                     total_frames: 300,
                     gop_size: 300,
                     decoder_model: false,
@@ -1053,10 +1057,10 @@ fn main() -> Result<()> {
             let se_size = probe.tus.get(2).map(|t| t.len()).unwrap_or(6) as u64;
             let kf_size = key_tu.len() as u64;
             let g_size = golden_tu.len() as u64;
-            let total = (duration * f64::from(eff_fps)).round() as u64;
+            let total = (duration * eff_fps).round() as u64;
 
             println!("input: key TU {kf_size} B, golden TU {g_size} B, repeat TU {se_size} B");
-            println!("projection: {duration}s @ {eff_fps}fps = {total} frames");
+            println!("projection: {duration}s @ {rate_num}/{rate_den} fps = {total} frames");
             println!(
                 "{:>8} {:>10} {:>10} {:>12}",
                 "gop", "video", "kbps", "worst seek"
@@ -1076,7 +1080,7 @@ fn main() -> Result<()> {
                     g,
                     fmt_bytes(bytes),
                     kbps,
-                    g as f64 / f64::from(eff_fps)
+                    g as f64 / eff_fps
                 );
             }
             println!("(elementary stream; container adds ~12 B/frame ivf, ~4 B/frame mp4)");
@@ -1165,6 +1169,7 @@ fn main() -> Result<()> {
                 stillcast::assemble::split_input(&ivf).context("splitting input")?;
             let params = stillcast::assemble::AssembleParams {
                 fps: 30,
+                fps_den: 1,
                 total_frames: 2,
                 gop_size: 2,
                 decoder_model: false,

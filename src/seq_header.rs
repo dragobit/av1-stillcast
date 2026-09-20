@@ -462,10 +462,17 @@ pub fn emit_sequence_header(sh: &SequenceHeader) -> Vec<u8> {
 /// Return a copy of `sh` declaring constant-rate timing for `fps`
 /// (timing_info + equal_picture_interval, no decoder model).
 pub fn with_timing_info(sh: &SequenceHeader, fps: u32) -> SequenceHeader {
+    with_timing_info_rate(sh, fps, 1)
+}
+
+/// Return a copy of `sh` declaring constant-rate timing at
+/// `rate_num`/`rate_den` frames per second — `time_scale = rate_num`,
+/// `num_units_in_display_tick = rate_den` (e.g. 30000/1001 for NTSC).
+pub fn with_timing_info_rate(sh: &SequenceHeader, rate_num: u32, rate_den: u32) -> SequenceHeader {
     let mut out = sh.clone();
     out.timing_info_present = true;
-    out.num_units_in_display_tick = 1;
-    out.time_scale = fps;
+    out.num_units_in_display_tick = rate_den.max(1);
+    out.time_scale = rate_num.max(1);
     out.equal_picture_interval = true;
     out.num_ticks_per_picture_minus_1 = 0;
     out
@@ -480,10 +487,20 @@ pub fn with_timing_info(sh: &SequenceHeader, fps: u32) -> SequenceHeader {
 /// declared field widths are load-bearing for the flag/removal-time bits
 /// already coded in its frame headers.
 pub fn with_decoder_model(sh: &SequenceHeader, fps: u32) -> Result<SequenceHeader> {
+    with_decoder_model_rate(sh, fps, 1)
+}
+
+/// Rational-rate variant of [`with_decoder_model`]: `rate_num`/`rate_den`
+/// frames per second, as with [`with_timing_info_rate`].
+pub fn with_decoder_model_rate(
+    sh: &SequenceHeader,
+    rate_num: u32,
+    rate_den: u32,
+) -> Result<SequenceHeader> {
     if sh.decoder_model_info_present {
         return Ok(sh.clone());
     }
-    let mut out = with_timing_info(sh, fps);
+    let mut out = with_timing_info_rate(sh, rate_num, rate_den);
     if sh.timing_info_present {
         if !sh.equal_picture_interval {
             bail!("decoder model on variable-interval streams would need temporal_point_info");
@@ -495,7 +512,7 @@ pub fn with_decoder_model(sh: &SequenceHeader, fps: u32) -> Result<SequenceHeade
     }
     out.decoder_model_info_present = true;
     out.buffer_delay_length_minus_1 = 31; // 32-bit delays
-    out.num_units_in_decoding_tick = fps;
+    out.num_units_in_decoding_tick = rate_num;
     // removal times we never emit would need <= 32 bits; 16 suffices as a
     // legal declaration since the flag is 0 in every header.
     out.buffer_removal_time_length_minus_1 = 15;
