@@ -23,8 +23,7 @@ the golden. The real requirements are per-TU *conditions*, not positions:
 Why a second frame exists at all: `show_existing_frame` may only
 re-display a `showable_frame` frame, and keyframes are never showable
 (spec-notes §2). The frame on screen for ~99% of the stream is the golden;
-the anchor is shown once per GOP. One coded frame can never satisfy the
-contract — see "single-frame sources" below.
+the anchor is shown once per GOP.
 
 ## What actually breaks (measured, libaom via ffmpeg, identical-still input)
 
@@ -93,30 +92,7 @@ per-encoder dependence:
    `compat.md`-style matrix of encoder × settings → pass/fail, not code
    branches.
 5. Fallback when nothing qualifies: decode to pixels and re-encode under
-   controlled settings (pixel-level adoption). In-browser that means a
-   second encoder (wasm) or the deferred synthesized-golden path below.
-
-## Single-frame sources
-
-A still-AVIF coded frame or a 1-frame IVF is exactly the *anchor* half of
-the contract: a `KEY_FRAME` can never be re-shown, and AVIF additionally
-mandates `still_picture=1` + `reduced_still_picture_header=1` — a
-single-frame-only sequence form that disables inter tools and that we
-reject by design. Adoption paths, in order of feasibility:
-
-- **pixels**: decode the AVIF → normal encode path (needs an AVIF-capable
-  demuxer/decoder in ffmpeg, or `avifdec` up front). Zero core changes;
-  the source coding isn't preserved, but the displayed frame is the golden
-  — which is re-encoded regardless.
-- **coded bits**: adopt the KF after normalizing its sequence header to
-  full form (the emit path exists) and splicing the omitted
-  `frame_size_override_flag` bit back into its frame header (the splice
-  machinery exists). The blocker is unchanged: a showable golden still has
-  to come from somewhere — re-encoding decoded pixels (displays the
-  re-encode, not the AVIF — pointless), borrowing a near-all-skip inter
-  (fragile, unverifiable without decoding), or synthesizing an all-skip
-  inter frame — a mini-encoder writing entropy-coded tile data, i.e. the
-  first step across this project's "no codec execution" boundary.
+   controlled settings (pixel-level adoption).
 
 ## Relaxations worth keeping in pocket
 
