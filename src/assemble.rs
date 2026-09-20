@@ -263,9 +263,12 @@ pub fn assemble_multi(segments: &[Segment], params: &AssembleParams) -> Result<A
                 golden_tu = tu_replace_seq_header(&golden_tu, payload)?;
             }
         }
-        let (key_tu, golden_tu) = if params.decoder_model {
-            // Scan with the ORIGINAL seq header: the flag is absent from the
-            // libaom-emitted headers; we insert it where the model wants it.
+        // Scan with the ORIGINAL seq header: the flag is absent from the
+        // encoder-emitted headers; we insert it where the model wants it.
+        // Inputs that already declare decoder_model_info code the flag in
+        // every frame header — splicing another bit in would shift the
+        // entire remainder of the header and corrupt the stream.
+        let (key_tu, golden_tu) = if params.decoder_model && !sh.decoder_model_info_present {
             (
                 tu_insert_removal_flag(&key_tu, &sh, &mut dpb).with_context(|| {
                     format!("splicing removal flag into keyframe (segment {i})")
@@ -1068,5 +1071,46 @@ mod tests {
         let ivf = ivf_of(vec![seq_only_tu(), kf_only_tu(), src[1].clone()]);
         let err = split_input(&ivf).unwrap_err().to_string();
         assert!(err.contains("cannot anchor"), "{err}");
+    }
+
+    #[test]
+    fn decoder_model_reexpand_is_idempotent() {
+        // Feeding a --decoder-model output back through expand must not
+        // splice a second buffer_removal_time_present_flag into headers
+        // that already carry it — that shifts every following bit and
+        // silently corrupts the stream.
+        let src = src_tus();
+        let params = AssembleParams {
+            fps: 30,
+            total_frames: 8,
+            gop_size: 8,
+            decoder_model: true,
+        };
+        let first = assemble(&src[0], &src[1], &params).unwrap();
+        let first_tus = first.tus.clone();
+        let ivf2 = ivf_of(first.tus);
+        let (k, g) = split_input(&ivf2).unwrap();
+        let second = assemble(&k, &g, &params).unwrap();
+        assert!(second.seq_header.decoder_model_info_present);
+        // Passthrough frames survive bit-exactly: no second flag splice.
+        assert_eq!(second.tus[0], first_tus[0]);
+        assert_eq!(second.tus[1], first_tus[1]);
+        // Every coded header still scans cleanly under the emitted
+        // sequence header.
+        let mut dpb = uheader::Dpb::default();
+        let mut scanned = 0;
+        for tu in &second.tus {
+            for obu in parse_obus(tu).unwrap() {
+                if matches!(obu.obu_type, ObuType::Frame | ObuType::FrameHeader)
+                    && obu.payload[0] & 0x80 == 0
+                // not show_existing_frame
+                {
+                    uheader::scan_uncompressed_header(&obu.payload, &second.seq_header, &mut dpb)
+                        .unwrap();
+                    scanned += 1;
+                }
+            }
+        }
+        assert_eq!(scanned, 2); // key + golden
     }
 }

@@ -475,7 +475,14 @@ pub fn with_timing_info(sh: &SequenceHeader, fps: u32) -> SequenceHeader {
 /// implies timing_info). Frames gain only `buffer_removal_time_present_flag`
 /// (we always emit it as 0): equal_picture_interval makes decode timing
 /// implicit, so no removal-time fields are ever written.
+///
+/// A stream that already declares the model is returned unchanged: its
+/// declared field widths are load-bearing for the flag/removal-time bits
+/// already coded in its frame headers.
 pub fn with_decoder_model(sh: &SequenceHeader, fps: u32) -> Result<SequenceHeader> {
+    if sh.decoder_model_info_present {
+        return Ok(sh.clone());
+    }
     let mut out = with_timing_info(sh, fps);
     if sh.timing_info_present {
         if !sh.equal_picture_interval {
