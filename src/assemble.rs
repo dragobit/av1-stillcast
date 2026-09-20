@@ -408,23 +408,41 @@ fn describe_coded(f: &frame_header::FrameHeaderInfo) -> String {
     )
 }
 
-/// Classify one TU for pair selection. `sh` tracks the most recently seen
-/// sequence header and is updated in OBU order, so a frame in the same TU as
-/// its sequence header parses under it.
-fn classify_tu(tu: &[u8], sh: &mut Option<SequenceHeader>) -> ScannedTu {
+/// Classify one TU for pair selection. `sh`/`sh_raw` track the most recently
+/// seen sequence header and are updated in OBU order, so a frame in the same
+/// TU as its sequence header parses under it. Returns the class plus whether
+/// this TU carried a sequence header with *different* bytes than the
+/// governing one — a generation change that invalidates any earlier anchor.
+fn classify_tu(
+    tu: &[u8],
+    sh: &mut Option<SequenceHeader>,
+    sh_raw: &mut Option<Vec<u8>>,
+) -> (ScannedTu, bool) {
     let obus = match parse_obus(tu) {
         Ok(o) => o,
-        Err(e) => return ScannedTu::Malformed(format!("{e:#}")),
+        Err(e) => return (ScannedTu::Malformed(format!("{e:#}")), false),
     };
     let mut seq_header = false;
+    let mut seq_changed = false;
     let mut frames: Vec<&Obu> = Vec::new();
     for obu in &obus {
         match obu.obu_type {
             ObuType::SequenceHeader => {
                 seq_header = true;
                 match seq_header::parse_sequence_header(&obu.payload) {
-                    Ok(p) => *sh = Some(p),
-                    Err(e) => return ScannedTu::Malformed(format!("bad sequence header: {e:#}")),
+                    Ok(p) => {
+                        if sh_raw.as_deref() != Some(obu.payload.as_slice()) {
+                            seq_changed = true;
+                            *sh_raw = Some(obu.payload.clone());
+                        }
+                        *sh = Some(p);
+                    }
+                    Err(e) => {
+                        return (
+                            ScannedTu::Malformed(format!("bad sequence header: {e:#}")),
+                            seq_changed,
+                        );
+                    }
                 }
             }
             ObuType::Frame | ObuType::FrameHeader => frames.push(obu),
@@ -432,7 +450,7 @@ fn classify_tu(tu: &[u8], sh: &mut Option<SequenceHeader>) -> ScannedTu {
         }
     }
     let Some(first) = frames.first() else {
-        return ScannedTu::NoCodedFrame { seq_header };
+        return (ScannedTu::NoCodedFrame { seq_header }, seq_changed);
     };
     let info = match sh.as_ref() {
         Some(sh) => frame_header::parse_frame_header_info(&first.payload, sh),
@@ -440,14 +458,17 @@ fn classify_tu(tu: &[u8], sh: &mut Option<SequenceHeader>) -> ScannedTu {
     };
     if let Ok(f) = &info {
         if f.show_existing_frame {
-            return ScannedTu::ShowExisting;
+            return (ScannedTu::ShowExisting, seq_changed);
         }
     }
-    ScannedTu::Coded {
-        seq_header,
-        extra_frames: frames.len() - 1,
-        info,
-    }
+    (
+        ScannedTu::Coded {
+            seq_header,
+            extra_frames: frames.len() - 1,
+            info,
+        },
+        seq_changed,
+    )
 }
 
 /// Extract (key TU, golden TU) from a coded stream produced by a real
@@ -456,24 +477,39 @@ fn classify_tu(tu: &[u8], sh: &mut Option<SequenceHeader>) -> ScannedTu {
 /// contract conditions:
 ///
 /// - **anchor**: contains the sequence header OBU and a shown KEY_FRAME.
+///   A later seq+KEY_FRAME TU re-anchors the search (multi-keyframe
+///   encodes); a *changed* sequence header in any other TU invalidates the
+///   anchor — the returned key TU and the golden must share one header.
 /// - **golden**: first TU after the anchor with a shown non-key frame that
-///   is showable, refreshes at least one reference slot, and — when the
-///   stream carries order hints — has `order_hint == anchor.order_hint + 1`
-///   (i.e. it was coded directly after the keyframe, so all its references
-///   resolve to keyframe slots and splicing it in cannot change its decode).
+///   is showable, refreshes at least one reference slot, and is
+///   *decode-adjacent* to the anchor: no inter-coded frame may sit between
+///   them, since a dropped coded frame could have refreshed the reference
+///   slots the golden reads (order_hint is display order, not decode
+///   adjacency). Intra-coded frames (KEY/INTRA_ONLY/SWITCH) are exempt —
+///   they decode without references, so each re-bases the DPB to its own
+///   picture and becomes the new predecessor. When the stream carries
+///   order hints, the golden must also have `order_hint == predecessor + 1`.
 ///
-/// TD-only, seq-header-only, metadata/padding, invisible-frame and
-/// show_existing TUs in the window are skipped, not fatal. A later
-/// seq+KEY_FRAME TU re-anchors the search (multi-keyframe encodes).
-/// When nothing qualifies, the error lists per-TU why each candidate missed.
+/// TD-only, seq-header-only, metadata/padding and show_existing TUs decode
+/// nothing new, so they are skipped, not fatal. When nothing qualifies,
+/// the error lists per-TU why each candidate missed.
 pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
     anyhow::ensure!(!ivf.frames.is_empty(), "input carries no temporal units");
     let window = ivf.frames.len().min(INPUT_SCAN_TUS);
 
     let mut sh: Option<SequenceHeader> = None;
+    let mut sh_raw: Option<Vec<u8>> = None;
     let mut lines: Vec<String> = Vec::new();
     // (TU index, order_hint, order_hint_bits of the governing seq header)
     let mut anchor: Option<(usize, u64, usize)> = None;
+    // The last coded frame that provably re-based the DPB to a known state:
+    // the anchor first, then any intra-family frame (each decodes without
+    // references). Golden order hints are checked against this predecessor.
+    let mut pred: Option<(usize, u64)> = None;
+    // First post-anchor coded TU whose decode could have changed what a
+    // later candidate sees — splicing candidates out from under it is
+    // unverifiable. Cleared when an intra-coded frame re-bases the DPB.
+    let mut dirty: Option<usize> = None;
     let mut golden = None;
     // Coded frames seen since the latest anchor / how many were non-key —
     // for the "forced keyframes" hint in failure diagnostics.
@@ -482,8 +518,27 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
     let mut key_only = true; // every parsed coded frame so far is a KEY_FRAME
 
     for (i, (_, tu)) in ivf.frames.iter().enumerate().take(window) {
-        let scan = classify_tu(tu, &mut sh);
-        let line = match &scan {
+        let (scan, seq_changed) = classify_tu(tu, &mut sh, &mut sh_raw);
+        // A different sequence header mid-window orphans an anchor taken
+        // under the previous one — unless this same TU re-anchors under it.
+        let reanchors = matches!(
+            &scan,
+            ScannedTu::Coded {
+                seq_header: true,
+                extra_frames: 0,
+                info: Ok(f),
+            } if f.frame_type == Some(KEY_FRAME) && f.show_frame
+        );
+        let invalidated = if seq_changed && !reanchors {
+            anchor.take().map(|(ai, _, _)| ai)
+        } else {
+            None
+        };
+        if invalidated.is_some() {
+            pred = None;
+            dirty = None;
+        }
+        let mut line = match &scan {
             ScannedTu::Malformed(e) => format!("TU{i}: unreadable — {e}"),
             ScannedTu::NoCodedFrame { seq_header } => format!(
                 "TU{i}: {} — skipped",
@@ -514,6 +569,21 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
                             after_anchor.1 += 1;
                         }
                     }
+                    // An intra-coded frame after the anchor decodes without
+                    // references and overwrites the slots it refreshes with
+                    // its own still: it re-bases the decode state and becomes
+                    // the predecessor a candidate's order_hint is measured
+                    // against.
+                    if anchor.is_some()
+                        && !is_anchor
+                        && matches!(
+                            ft,
+                            KEY_FRAME | frame_header::INTRA_ONLY_FRAME | frame_header::SWITCH_FRAME
+                        )
+                    {
+                        pred = Some((i, f.order_hint));
+                        dirty = None;
+                    }
                     if *extra_frames > 0 {
                         format!(
                             "TU{i}: {} coded frames in one TU (spatial/SVC layering) — unsupported",
@@ -529,6 +599,8 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
                             f.order_hint,
                             sh.as_ref().map_or(0, |s| s.order_hint_bits),
                         ));
+                        pred = Some((i, f.order_hint));
+                        dirty = None;
                         after_anchor = (0, 0);
                         n_anchors += 1;
                         format!(
@@ -556,6 +628,13 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
                                      (golden must be a shown non-key frame)"
                                 )
                             }
+                            Some(_) if let Some(j) = dirty => {
+                                format!(
+                                    "TU{i}: {} — preceded by coded TU{j}; decode state \
+                                     after splicing is unverifiable",
+                                    describe_coded(f)
+                                )
+                            }
                             Some(_) if !f.show_frame => {
                                 format!("TU{i}: {} — skipped (not shown)", describe_coded(f))
                             }
@@ -571,25 +650,26 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
                                     describe_coded(f)
                                 )
                             }
-                            Some((_, aoh, bits)) => {
-                                let want = (aoh + 1) % (1u64 << bits.max(1));
+                            Some((ai, aoh, bits)) => {
+                                let (pi, poh) = pred.unwrap_or((ai, aoh));
+                                let want = (poh + 1) % (1u64 << bits.max(1));
                                 if bits == 0 {
                                     golden = Some(i);
                                     format!(
                                         "TU{i}: golden — {}; stream carries no order hints, \
-                                         adjacency unverifiable",
+                                         adjacency verified by decode order only",
                                         describe_coded(f)
                                     )
                                 } else if f.order_hint == want {
                                     golden = Some(i);
                                     format!(
-                                        "TU{i}: golden — {}, order_hint {} == anchor+1",
+                                        "TU{i}: golden — {}, order_hint {} == TU{pi}+1",
                                         describe_coded(f),
                                         f.order_hint
                                     )
                                 } else {
                                     format!(
-                                        "TU{i}: order_hint={} vs anchor+1={} — \
+                                        "TU{i}: order_hint={} vs TU{pi}+1={} — \
                                          coded against other frames",
                                         f.order_hint, want
                                     )
@@ -600,6 +680,30 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
                 }
             },
         };
+        // Whatever this TU decodes changes what a later candidate sees: a
+        // skipped coded frame that refreshed slots (an invisible alt-ref
+        // counts), a multi-frame TU we can't fully parse, an unparsable
+        // frame or a malformed TU all make the next candidate unverifiable.
+        // Intra-coded frames re-based instead (handled above); frames with
+        // refresh_frame_flags == 0 decode without touching the DPB.
+        let dirties = match &scan {
+            ScannedTu::Malformed(_) => true,
+            ScannedTu::Coded {
+                extra_frames, info, ..
+            } => {
+                *extra_frames > 0
+                    || info.is_err()
+                    || matches!(info, Ok(f) if f.frame_type == Some(frame_header::INTER_FRAME)
+                        && f.refresh_frame_flags != 0)
+            }
+            _ => false,
+        };
+        if anchor.is_some() && dirties && dirty.is_none() {
+            dirty = Some(i);
+        }
+        if let Some(ai) = invalidated {
+            line = format!("{line}; new sequence header — anchor TU{ai} no longer applies");
+        }
         lines.push(line);
         if golden.is_some() {
             break;
@@ -817,16 +921,90 @@ mod tests {
     }
 
     #[test]
-    fn skips_show_existing_and_invisible_tus() {
+    fn skips_show_existing_tu_before_golden() {
+        // show_existing decodes nothing and refreshes nothing — the golden
+        // after it still sees the anchor's DPB.
+        let src = src_tus();
+        let ivf = ivf_of(vec![src[0].clone(), show_existing_tu(0), src[1].clone()]);
+        let (k, g) = split_input(&ivf).unwrap();
+        assert_eq!(k, src[0]);
+        assert_eq!(g, src[1]);
+    }
+
+    #[test]
+    fn tolerates_invisible_frame_that_refreshes_nothing() {
+        // refresh_frame_flags == 0: decoded but wrote no ref slots, so the
+        // golden's decode environment is provably unchanged.
+        let src = src_tus();
+        let sh = src_sh();
+        let invisible = coded_frame_tu(&sh, frame_header::INTER_FRAME, false, true, true, 1, 0);
+        let ivf = ivf_of(vec![src[0].clone(), invisible, src[1].clone()]);
+        let (k, g) = split_input(&ivf).unwrap();
+        assert_eq!(k, src[0]);
+        assert_eq!(g, src[1]);
+    }
+
+    #[test]
+    fn rejects_golden_after_a_refreshing_inter_frame() {
+        // An invisible alt-ref between anchor and golden refreshes slots the
+        // golden may read — order_hint adjacency cannot detect that, so the
+        // candidate is unverifiable.
         let src = src_tus();
         let sh = src_sh();
         let invisible = coded_frame_tu(&sh, frame_header::INTER_FRAME, false, true, true, 1, 0xff);
-        let ivf = ivf_of(vec![
-            src[0].clone(),
-            show_existing_tu(0),
-            invisible,
-            src[1].clone(),
-        ]);
+        let ivf = ivf_of(vec![src[0].clone(), invisible, src[1].clone()]);
+        let err = split_input(&ivf).unwrap_err().to_string();
+        assert!(err.contains("unverifiable"), "{err}");
+        assert!(err.contains("TU1"), "{err}");
+    }
+
+    #[test]
+    fn rebases_on_an_intra_only_frame() {
+        // INTRA_ONLY decodes without references, so it re-bases the decode
+        // state: an inter coded right after it is adjacency-checkable
+        // against *its* order_hint, not the anchor's.
+        let src = src_tus();
+        let sh = src_sh();
+        let intra = coded_frame_tu(
+            &sh,
+            frame_header::INTRA_ONLY_FRAME,
+            false,
+            false,
+            true,
+            1,
+            0xff,
+        );
+        let golden = coded_frame_tu(&sh, frame_header::INTER_FRAME, true, true, true, 2, 0x02);
+        let ivf = ivf_of(vec![src[0].clone(), intra, golden.clone()]);
+        let (k, g) = split_input(&ivf).unwrap();
+        assert_eq!(k, src[0]);
+        assert_eq!(g, golden);
+    }
+
+    #[test]
+    fn changed_sequence_header_invalidates_the_anchor() {
+        // A seq-only TU carrying a *different* sequence header orphans the
+        // anchor taken under the previous one — the golden can no longer be
+        // paired with the old key TU.
+        let src = src_tus();
+        let mut sh2 = src_sh();
+        sh2.use_128x128_superblock = !sh2.use_128x128_superblock;
+        let alt_seq_tu = wrap_tu(vec![Obu {
+            obu_type: ObuType::SequenceHeader,
+            extension: None,
+            payload: seq_header::emit_sequence_header(&sh2),
+        }]);
+        let ivf = ivf_of(vec![src[0].clone(), alt_seq_tu, src[1].clone()]);
+        let err = split_input(&ivf).unwrap_err().to_string();
+        assert!(err.contains("anchor TU0 no longer applies"), "{err}");
+    }
+
+    #[test]
+    fn identical_sequence_header_keeps_the_anchor() {
+        // Encoders that re-emit an identical sequence header mid-stream
+        // don't invalidate the anchor.
+        let src = src_tus();
+        let ivf = ivf_of(vec![src[0].clone(), seq_only_tu(), src[1].clone()]);
         let (k, g) = split_input(&ivf).unwrap();
         assert_eq!(k, src[0]);
         assert_eq!(g, src[1]);
@@ -868,7 +1046,7 @@ mod tests {
         let src = src_tus();
         let ivf = ivf_of(vec![src[0].clone(), src[2].clone()]);
         let err = split_input(&ivf).unwrap_err().to_string();
-        assert!(err.contains("order_hint=2 vs anchor+1=1"), "{err}");
+        assert!(err.contains("order_hint=2 vs TU0+1=1"), "{err}");
     }
 
     #[test]

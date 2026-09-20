@@ -17,23 +17,36 @@ the first 8 TUs) and tests per-TU *conditions*, not positions:
   re-emitted-header encodes are tolerated.
 - **golden TU** — the first TU after the anchor that is shown,
   `frame_type != KEY_FRAME`, `showable_frame` (auto-derived for shown
-  non-key frames), `refresh_frame_flags != 0`, and decodable directly
-  after the anchor — its references must resolve to slots that all hold
-  the keyframe. Detected via `order_hint == anchor.order_hint + 1`
-  (coded as the next display frame).
+  non-key frames), `refresh_frame_flags != 0`, and *decode-adjacent* to
+  the anchor: no inter-coded frame may sit between them, because a
+  dropped coded frame could have refreshed the reference slots the
+  golden reads (`order_hint` is display order, not decode adjacency — an
+  invisible alt-ref that refreshes a slot makes the next candidate
+  unverifiable). Intra-coded frames (KEY/INTRA_ONLY/SWITCH) are exempt:
+  they decode without references and re-base the DPB, so a candidate
+  after one is measured against *it*. On top of decode adjacency, when
+  the stream carries order hints the golden must have
+  `order_hint == predecessor + 1`.
 
 Skipped without failing: TD-only / seq-header-only / metadata / padding
-TUs, invisible frames, show_existing TUs. When nothing qualifies, the
-error lists every scanned TU and *why* it missed (e.g. `TU2: KEY_FRAME —
-encoder forced keyframes; drop "-g 1"`, `TU4: order_hint=5 vs
-anchor+1=1 — coded against other frames`).
+TUs, show_existing TUs, coded frames that refresh nothing. When nothing
+qualifies, the error lists every scanned TU and *why* it missed (e.g.
+`TU2: KEY_FRAME — encoder forced keyframes; drop "-g 1"`, `TU4:
+order_hint=5 vs TU0+1=1 — coded against other frames`, `TU3: preceded
+by coded TU2; decode state after splicing is unverifiable`).
+
+A sequence header whose bytes *change* mid-window invalidates a prior
+anchor — the key TU returned and the golden must parse under the same
+header. A same-TU seq+keyframe still re-anchors under the new header;
+identical re-emitted headers change nothing.
 
 Degradation when order hints are absent: some thin-control encoders
 emit `order_hint_bits = 0` (e.g. Chrome's WebCodecs AV1 encoder — the
 `order_hint` field is then absent from frame headers entirely). The
-adjacency guard is unverifiable there and is skipped rather than forced:
-the golden reduces to shown + non-key + showable + refreshes a slot.
-Streams with real order hints keep the strict check.
+order-hint check is skipped there, but decode-order adjacency still
+applies — the golden is the first shown non-key refreshing frame after
+the anchor with no slot-refreshing coded frame in between. Streams with
+real order hints keep the strict check on top of that.
 
 Why a second frame exists at all: `show_existing_frame` may only
 re-display a `showable_frame` frame, and keyframes are never showable
@@ -92,11 +105,12 @@ Positional acceptance was the fragile part. Status of the fix that
 dissolves per-encoder dependence:
 
 1. **Done** — `split_input` scans a bounded window (first 8 TUs) for the
-   anchor TU, then the golden TU under the conditions above — including
-   the `order_hint` adjacency guard (skipped when the stream carries no
-   order hints), which guarantees the golden was coded against only the
-   keyframe's decoder state, so splicing it after the anchor cannot change
-   its decode.
+   anchor TU, then the golden TU under the conditions above — decode-order
+   adjacency (no slot-refreshing coded frame between it and its
+   predecessor) plus `order_hint == predecessor + 1` when the stream
+   carries order hints. Together they guarantee the golden was coded
+   against only the keyframe's decoder state, so splicing it after the
+   anchor cannot change its decode.
 2. **Done** — encode more than 2 input frames so drops and leading
    invisible frames are survivable; `encode` emits 4 and the scan ignores
    the tail. ~1 s worth is the recommended headroom.

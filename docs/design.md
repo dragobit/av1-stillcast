@@ -103,15 +103,19 @@ TUs, positions never hard-coded) for the two TUs it needs:
 
 - **anchor** — a TU containing the sequence header and a shown keyframe;
 - **golden** — the first TU after the anchor that is shown, non-key,
-  showable, refreshes ≥1 reference slot, and (when the stream carries order
-  hints) has `order_hint == anchor.order_hint + 1` — i.e. it was coded
-  directly after the keyframe, so splicing it in cannot change its decode.
+  showable, refreshes ≥1 reference slot, and is decode-adjacent: no
+  slot-refreshing coded frame may sit between it and the anchor (intra
+  frames re-base the DPB and become the new predecessor), and when the
+  stream carries order hints it must have `order_hint == predecessor + 1`
+  — i.e. it was coded directly after the keyframe, so splicing it in
+  cannot change its decode.
 
-Frameless TUs (TD/metadata/padding/seq-only), invisible frames,
-show_existing TUs, and extra keyframes in the window are skipped; a later
-seq+keyframe TU re-anchors the search. Failures report per-TU why each
-candidate missed. Accepted containers: IVF, low-overhead OBU stream,
-Annex-B — sniffed by content, no ffmpeg involvement (see
+Frameless TUs (TD/metadata/padding/seq-only), show_existing TUs, and
+extra keyframes in the window are skipped; a later seq+keyframe TU
+re-anchors the search; a *changed* sequence header invalidates the
+anchor. Failures report per-TU why each candidate missed. Accepted
+containers: IVF, low-overhead OBU stream, Annex-B — sniffed by content,
+no ffmpeg involvement (see
 `docs/input-formats.md` for why mp4/mkv are deliberately excluded).
 Rejected up front: reduced still-picture headers, frame id numbers,
 unequal-interval decoder-model timing, film grain.
