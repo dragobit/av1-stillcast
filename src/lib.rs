@@ -2,6 +2,7 @@ pub mod adts;
 pub mod api;
 pub mod assemble;
 pub mod bitio;
+pub mod container;
 pub mod frame_header;
 pub mod inspect;
 pub mod ivf;

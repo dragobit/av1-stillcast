@@ -70,6 +70,11 @@ ffmpeg -loop 1 -i jacket.png -vf format=yuv420p \
 # 2. Inspect the input (finds the golden reference slot).
 stillcast info -i src.ivf
 
+# Input containers: expand/plan/info accept IVF, raw OBU streams
+# (aomenc --obu, SVT-AV1, WebCodecs chunks) and Annex-B natively —
+# no ffmpeg needed for the demux. mp4/mkv inputs can be remuxed with
+# `ffmpeg -i in -c:v copy -f ivf out.ivf`; `info` reads them directly.
+
 # 3a. Expand to IVF (1 hour, 30 fps, keyframe every 300 frames = 10 s seek).
 stillcast expand -i src.ivf -o out.ivf --duration 3600 --gop 300
 
@@ -108,7 +113,7 @@ stillcast make --playlist tracks.txt -a album.m4a -o album.mp4
 #   cover3.png  03:05.500     # ffmpeg-style MM:SS.mmm / HH:MM:SS.mmm / Ns
 #   cover4.png                # remainder
 stillcast expand --playlist encoded.txt -o out.ivf --duration 3600
-# encoded.txt lists .ivf sources instead of images
+# encoded.txt lists .ivf/.obu/.av1b sources instead of images
 ```
 
 Each emitted GOP is: keyframe TU → golden TU → `show_existing_frame` TU ×
@@ -161,6 +166,8 @@ CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/dem
 - [x] Library + C ABI: `expand_ivf`/`expand_ivf_multi` (bytes in → IVF
       bytes out) and `stillcast_expand`/`stillcast_free` →
       `libstillcast.{so,a}` + `include/stillcast.h`
+- [x] Input containers: IVF + low-overhead OBU + Annex-B sniffed natively
+      (ffmpeg-free core; see `docs/input-formats.md`)
 - [ ] WebM/MKV output
 - [x] Decoder-model: `--decoder-model` emits `decoder_model_info` +
       `buffer_removal_time_present_flag` (opt-in; `equal_picture_interval`

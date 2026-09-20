@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 
 use crate::assemble::{self, AssembleParams, Segment};
+use crate::container;
 use crate::ivf;
 
 /// Parameters for [`expand_ivf`] / [`expand_ivf_multi`].
@@ -26,17 +27,19 @@ pub struct ExpandParams {
 /// golden frames, e.g. produced by `stillcast encode` or a libaom pipeline)
 /// plus how many output frames it is shown for.
 pub struct SegmentInput<'a> {
-    /// Complete IVF file bytes (must contain >= 2 coded frames).
+    /// Complete input bytes: IVF, low-overhead OBU, or Annex-B
+    /// (must contain >= 2 coded frames).
     pub ivf: &'a [u8],
     /// Output frame count for this segment.
     pub frames: u64,
 }
 
-/// Expand a 2-frame IVF encode into a long static-video AV1 stream.
+/// Expand a 2-frame encode into a long static-video AV1 stream.
 ///
-/// `input` is a complete IVF file whose first packet is a keyframe TU (with
-/// sequence header) and second is the golden inter TU. Returns a complete
-/// IVF file containing the expanded temporal units.
+/// `input` is a complete IVF file, low-overhead OBU stream, or Annex-B
+/// stream whose first temporal unit is a keyframe TU (with sequence header)
+/// and second is the golden inter TU. Returns a complete IVF file
+/// containing the expanded temporal units.
 pub fn expand_ivf(input: &[u8], params: &ExpandParams) -> Result<Vec<u8>> {
     expand_ivf_multi(
         &[SegmentInput {
@@ -57,7 +60,9 @@ pub fn expand_ivf_multi(segments: &[SegmentInput], params: &ExpandParams) -> Res
     let mut donor = None;
     let mut pairs = Vec::with_capacity(segments.len());
     for (i, s) in segments.iter().enumerate() {
-        let ivf = ivf::read(s.ivf).with_context(|| format!("parsing segment {i} IVF"))?;
+        let ivf = container::read(s.ivf)
+            .with_context(|| format!("parsing segment {i} input"))?
+            .ivf;
         let pair =
             assemble::split_input(&ivf).with_context(|| format!("splitting segment {i} input"))?;
         if donor.is_none() {

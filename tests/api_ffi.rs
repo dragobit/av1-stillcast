@@ -84,6 +84,32 @@ fn c_abi_error_path() {
 }
 
 #[test]
+fn expand_accepts_obu_and_annexb_inputs() {
+    // The 2-frame input contract is container-agnostic: the same encode as
+    // a raw OBU stream and as Annex-B must expand identically to the IVF.
+    let packets: Vec<Vec<u8>> = ivf::read(SRC)
+        .unwrap()
+        .frames
+        .into_iter()
+        .map(|(_, tu)| tu)
+        .collect();
+    let params = ExpandParams {
+        fps: Some(30),
+        total_frames: 60,
+        gop_size: 30,
+        decoder_model: false,
+    };
+    let expected = expand_ivf(SRC, &params).unwrap();
+    for bytes in [
+        stillcast::container::write_obu_stream(&packets),
+        stillcast::container::write_annexb(&packets),
+    ] {
+        let out = expand_ivf(&bytes, &params).unwrap();
+        assert_eq!(out, expected);
+    }
+}
+
+#[test]
 fn expand_ivf_rejects_garbage() {
     assert!(expand_ivf(
         b"not ivf",
