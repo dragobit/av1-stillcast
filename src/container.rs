@@ -122,12 +122,22 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
         30
     };
 
-    let first_frame = parse_obus(&frames[0].1)?
-        .into_iter()
-        .find(|obu| matches!(obu.obu_type, ObuType::Frame | ObuType::FrameHeader))
-        .context("first temporal unit carries no coded frame")?;
-    let scan = uheader::scan_uncompressed_header(&first_frame.payload, &sh, &mut Dpb::default())
-        .context("first temporal unit: bad uncompressed header")?;
+    // Geometry comes from the first TU carrying a coded frame — leading
+    // frameless TUs (metadata/padding in Annex-B or IVF inputs) don't yield
+    // a header to parse.
+    let first_frame = frames
+        .iter()
+        .enumerate()
+        .find_map(|(i, tu)| {
+            parse_obus(&tu.1)
+                .ok()?
+                .into_iter()
+                .find(|obu| matches!(obu.obu_type, ObuType::Frame | ObuType::FrameHeader))
+                .map(|obu| (i, obu.payload))
+        })
+        .context("no temporal unit carries a coded frame")?;
+    let scan = uheader::scan_uncompressed_header(&first_frame.1, &sh, &mut Dpb::default())
+        .with_context(|| format!("TU {}: bad uncompressed header", first_frame.0))?;
     let width = u16::try_from(scan.upscaled_width).context("frame width exceeds IVF limit")?;
     let height = u16::try_from(scan.frame_height).context("frame height exceeds IVF limit")?;
 

@@ -8,17 +8,32 @@ control (WebCodecs, hardware encoders, platform APIs) can feed it.
 
 ## The contract, restated as conditions
 
-Today `split_input` requires ≥2 packets and treats them positionally:
-packet 0 must carry a sequence-header OBU + shown KEY_FRAME, packet 1 is
-the golden. The real requirements are per-TU *conditions*, not positions:
+**Implemented:** `split_input` scans a bounded window (`INPUT_SCAN_TUS` =
+the first 8 TUs) and tests per-TU *conditions*, not positions:
 
 - **anchor TU** — contains the sequence header and a shown `KEY_FRAME`
   (decoder reset + random-access point; all 8 ref slots refresh to it).
-- **golden TU** — shown, `frame_type != KEY_FRAME`, `showable_frame`
-  (auto-derived for shown non-key frames), `refresh_frame_flags != 0`, and
-  decodable directly after the anchor — its references must resolve to
-  slots that all hold the keyframe. Detectable via
-  `order_hint == anchor.order_hint + 1` (coded as the next display frame).
+  A later seq+keyframe TU *re-anchors* the search, so multi-keyframe or
+  re-emitted-header encodes are tolerated.
+- **golden TU** — the first TU after the anchor that is shown,
+  `frame_type != KEY_FRAME`, `showable_frame` (auto-derived for shown
+  non-key frames), `refresh_frame_flags != 0`, and decodable directly
+  after the anchor — its references must resolve to slots that all hold
+  the keyframe. Detected via `order_hint == anchor.order_hint + 1`
+  (coded as the next display frame).
+
+Skipped without failing: TD-only / seq-header-only / metadata / padding
+TUs, invisible frames, show_existing TUs. When nothing qualifies, the
+error lists every scanned TU and *why* it missed (e.g. `TU2: KEY_FRAME —
+encoder forced keyframes; drop "-g 1"`, `TU4: order_hint=5 vs
+anchor+1=1 — coded against other frames`).
+
+Degradation when order hints are absent: some thin-control encoders
+emit `order_hint_bits = 0` (e.g. Chrome's WebCodecs AV1 encoder — the
+`order_hint` field is then absent from frame headers entirely). The
+adjacency guard is unverifiable there and is skipped rather than forced:
+the golden reduces to shown + non-key + showable + refreshes a slot.
+Streams with real order hints keep the strict check.
 
 Why a second frame exists at all: `show_existing_frame` may only
 re-display a `showable_frame` frame, and keyframes are never showable
@@ -73,21 +88,23 @@ is runtimes that reshape the TU stream around the two packets:
 
 ## Direction: scan, don't index
 
-Positional acceptance is the fragile part. The fix that dissolves
-per-encoder dependence:
+Positional acceptance was the fragile part. Status of the fix that
+dissolves per-encoder dependence:
 
-1. Accept ≥2 packets, scan a bounded window (e.g. first ~8 TUs) for the
+1. **Done** — `split_input` scans a bounded window (first 8 TUs) for the
    anchor TU, then the golden TU under the conditions above — including
-   the `order_hint` adjacency guard, which guarantees the golden was coded
-   against only the keyframe's decoder state, so splicing it after the
-   anchor cannot change its decode.
-2. Encode more than 2 input frames (~1 s worth) so drops and leading
-   invisible frames are survivable; `encode` already emits 4 and discards
-   the tail — keep that headroom explicit.
-3. **Probe per environment**: at acquisition time (not assembly time), run
-   a probe encode of a still and check the contract — same pattern as
-   `plan`'s probe-encode-for-cost-model. Encoder identity never enters the
-   decision; only whether the produced TU stream satisfies the conditions.
+   the `order_hint` adjacency guard (skipped when the stream carries no
+   order hints), which guarantees the golden was coded against only the
+   keyframe's decoder state, so splicing it after the anchor cannot change
+   its decode.
+2. **Done** — encode more than 2 input frames so drops and leading
+   invisible frames are survivable; `encode` emits 4 and the scan ignores
+   the tail. ~1 s worth is the recommended headroom.
+3. **Probe per environment** (open): at acquisition time (not assembly
+   time), run a probe encode of a still and check the contract — same
+   pattern as `plan`'s probe-encode-for-cost-model. Encoder identity never
+   enters the decision; only whether the produced TU stream satisfies the
+   conditions.
 4. Per-encoder "known-good settings" degrade to documentation — a
    `compat.md`-style matrix of encoder × settings → pass/fail, not code
    branches.
@@ -106,8 +123,8 @@ per-encoder dependence:
 
 ## Open items
 
-- Scan-window bound, and "nearest miss" diagnostics (report *why* each
-  scanned TU failed, not just that none qualified).
-- Multi-keyframe tolerance: skip leading KFs/SE TUs before the golden.
-- Whether the two source TUs may sit in different segments (they may —
-  segment boundaries reset the DPB anyway).
+- Probe-verify at acquisition time (item 3 above) and pixel-level
+  re-encode fallback (item 5).
+- The two source TUs may sit in different segments — each segment's
+  source gets the same scan (segment boundaries reset the DPB anyway).
+  Confirmed working.

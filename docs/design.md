@@ -97,18 +97,28 @@ model across segments in decode order.
 
 ## Input contract
 
-Input must contain ≥2 temporal units produced by a conformant encoder for
-the same static picture: TU 0 = seq header + shown keyframe; TU 1 = the
-golden (a shown inter frame is what libaom emits for identical content).
-Accepted containers: IVF, low-overhead OBU stream, Annex-B — sniffed by
-content, no ffmpeg involvement (see `docs/input-formats.md` for why mp4/mkv
-are deliberately excluded). Rejected up front: reduced still-picture
-headers, frame id numbers, unequal-interval decoder-model timing, film
-grain.
+Input is a short encode of the same static picture from a conformant
+encoder. `split_input` scans a bounded window (`INPUT_SCAN_TUS` = 8 leading
+TUs, positions never hard-coded) for the two TUs it needs:
+
+- **anchor** — a TU containing the sequence header and a shown keyframe;
+- **golden** — the first TU after the anchor that is shown, non-key,
+  showable, refreshes ≥1 reference slot, and (when the stream carries order
+  hints) has `order_hint == anchor.order_hint + 1` — i.e. it was coded
+  directly after the keyframe, so splicing it in cannot change its decode.
+
+Frameless TUs (TD/metadata/padding/seq-only), invisible frames,
+show_existing TUs, and extra keyframes in the window are skipped; a later
+seq+keyframe TU re-anchors the search. Failures report per-TU why each
+candidate missed. Accepted containers: IVF, low-overhead OBU stream,
+Annex-B — sniffed by content, no ffmpeg involvement (see
+`docs/input-formats.md` for why mp4/mkv are deliberately excluded).
+Rejected up front: reduced still-picture headers, frame id numbers,
+unequal-interval decoder-model timing, film grain.
 
 How the contract holds under encoders/environments that can't be
-configured (and how positional acceptance should evolve into condition
-scanning): [`docs/input-contract.md`](input-contract.md).
+configured (WebCodecs, HW encoders, runtimes that drop frames), and the
+measured encoder matrix: [`docs/input-contract.md`](input-contract.md).
 
 ## MP4 output
 

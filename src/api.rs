@@ -27,19 +27,20 @@ pub struct ExpandParams {
 /// golden frames, e.g. produced by `stillcast encode` or a libaom pipeline)
 /// plus how many output frames it is shown for.
 pub struct SegmentInput<'a> {
-    /// Complete input bytes: IVF, low-overhead OBU, or Annex-B
-    /// (must contain >= 2 coded frames).
+    /// Complete input bytes: IVF, low-overhead OBU, or Annex-B (scanned for
+    /// an anchor keyframe TU + golden TU pair).
     pub ivf: &'a [u8],
     /// Output frame count for this segment.
     pub frames: u64,
 }
 
-/// Expand a 2-frame encode into a long static-video AV1 stream.
+/// Expand a short encode into a long static-video AV1 stream.
 ///
 /// `input` is a complete IVF file, low-overhead OBU stream, or Annex-B
-/// stream whose first temporal unit is a keyframe TU (with sequence header)
-/// and second is the golden inter TU. Returns a complete IVF file
-/// containing the expanded temporal units.
+/// stream; its leading temporal units are scanned for the anchor TU
+/// (sequence header + shown keyframe) and the golden TU (the shown non-key
+/// frame coded directly after it — see `assemble::split_input`). Returns a
+/// complete IVF file containing the expanded temporal units.
 pub fn expand_ivf(input: &[u8], params: &ExpandParams) -> Result<Vec<u8>> {
     expand_ivf_multi(
         &[SegmentInput {
