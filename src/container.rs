@@ -50,8 +50,15 @@ pub struct Input {
 /// Errors carry a remux hint for unsupported or unrecognizable inputs.
 pub fn read(data: &[u8]) -> Result<Input> {
     if data.starts_with(b"DKIF") {
+        let mut ivf = ivf::read(data)?;
+        // IVF packets bypass finish(), so canonicalize TU bytes here —
+        // a mid-packet TemporalDelimiter would otherwise reach the
+        // assembler as a non-compliant TU.
+        for (_, tu) in &mut ivf.frames {
+            *tu = canonicalize_tu(tu);
+        }
         return Ok(Input {
-            ivf: ivf::read(data)?,
+            ivf,
             format: Format::Ivf,
         });
     }
@@ -95,11 +102,7 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
         let obus = parse_obus(tu).with_context(|| format!("TU {i}: bad OBU framing"))?;
         let mut out = Vec::with_capacity(tu.len());
         for (j, obu) in obus.iter().enumerate() {
-            // A TemporalDelimiter only marks a temporal-unit boundary: it is
-            // meaningful solely as a TU's first OBU. Drop deeper ones so
-            // normalized TUs stay spec-valid even when a container-level TU
-            // (IVF packet, Annex-B unit) carries a stray delimiter.
-            if obu.obu_type == ObuType::TemporalDelimiter && j > 0 {
+            if is_stray_td(j, obu) {
                 continue;
             }
             obu.write(&mut out);
@@ -324,6 +327,33 @@ fn concat_tu(front: Vec<Obu>, back: Vec<Obu>) -> Vec<Obu> {
     body
 }
 
+/// A TemporalDelimiter marks a temporal-unit boundary and is meaningful
+/// solely as a TU's first OBU — a TD at any deeper position is a stray.
+fn is_stray_td(position: usize, obu: &Obu) -> bool {
+    obu.obu_type == ObuType::TemporalDelimiter && position > 0
+}
+
+/// Canonicalize one temporal unit's OBU byte string by dropping stray
+/// TemporalDelimiters. Re-serializes only when a stray TD is present;
+/// input that fails OBU framing is returned unchanged — the downstream
+/// scan reports the real error.
+fn canonicalize_tu(tu: &[u8]) -> Vec<u8> {
+    let Ok(obus) = parse_obus(tu) else {
+        return tu.to_vec();
+    };
+    if !obus.iter().enumerate().any(|(j, o)| is_stray_td(j, o)) {
+        return tu.to_vec();
+    }
+    let mut out = Vec::with_capacity(tu.len());
+    for (j, obu) in obus.iter().enumerate() {
+        if is_stray_td(j, obu) {
+            continue;
+        }
+        obu.write(&mut out);
+    }
+    out
+}
+
 /// Split an Annex-B byte stream into temporal units.
 /// Layout: `[leb128 temporal_unit_size] [frame_unit ...]` where each
 /// frame_unit is `[leb128 frame_unit_size] [leb128 obu_size + obu ...]`.
@@ -526,6 +556,30 @@ mod tests {
         assert_eq!(td_count(&input.ivf.frames.last().unwrap().1), 1);
         assert_eq!(last.first().unwrap().obu_type, ObuType::TemporalDelimiter);
         assert_eq!(last.last().unwrap().obu_type, ObuType::Metadata);
+    }
+
+    #[test]
+    fn ivf_packet_with_mid_tu_td_is_normalized() {
+        // IVF input returns before finish(), so canonicalization runs in
+        // read(): splice a stray TD into packet 0 and confirm it is dropped.
+        let mut ivf = ivf::read(SRC_IVF).unwrap();
+        let (ts, tu) = ivf.frames[0].clone();
+        let mut mutated = Vec::new();
+        for obu in parse_obus(&tu).unwrap() {
+            obu.write(&mut mutated);
+            if obu.obu_type == ObuType::SequenceHeader {
+                Obu::temporal_delimiter().write(&mut mutated); // stray mid-TU TD
+            }
+        }
+        ivf.frames[0] = (ts, mutated);
+
+        let input = read(&ivf::write(&ivf)).unwrap();
+        assert_eq!(input.format, Format::Ivf);
+        assert_eq!(input.ivf.frames.len(), ivf.frames.len());
+        assert_eq!(td_count(&input.ivf.frames[0].1), 1);
+        let obus0 = parse_obus(&input.ivf.frames[0].1).unwrap();
+        assert_eq!(obus0[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(obus0[1].obu_type, ObuType::SequenceHeader);
     }
 
     #[test]
