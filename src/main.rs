@@ -69,19 +69,21 @@ enum Cmd {
         #[arg(long)]
         keep_work: bool,
     },
-    /// Expand a 2-frame IVF encode into a long static-video AV1 bitstream.
+    /// Expand a 2-frame encode into a long static-video AV1 bitstream.
     ///
     /// Pure coded-frames-in → elementary-stream-out transform; `-i -` reads
-    /// the IVF from stdin and `-o -` writes IVF to stdout, so it composes
-    /// with ffmpeg in a shell pipeline.
+    /// the input (IVF / OBU / Annex-B) from stdin and `-o -` writes IVF to
+    /// stdout, so it composes with ffmpeg in a shell pipeline.
     #[command(name = "expand", visible_alias = "assemble")]
     Expand {
-        /// Input IVF: >=2 frames; frame 0 = keyframe, frame 1 = golden (inter).
-        /// `-` reads stdin. Mutually exclusive with --playlist.
+        /// Input: IVF / OBU stream / Annex-B; >=2 frames: frame 0 = keyframe,
+        /// frame 1 = golden (inter). `-` reads stdin. Mutually exclusive
+        /// with --playlist.
         #[arg(short, long, conflicts_with = "playlist")]
         input: Option<PathBuf>,
-        /// Playlist file: one `input.ivf [duration]` per line (# comments,
+        /// Playlist file: one `input [duration]` per line (# comments,
         /// last entry may omit duration to fill --duration/--frames).
+        /// Each entry may be IVF, OBU, or Annex-B.
         /// Duration forms: seconds | Ns | Nf (frames) | MM:SS[.mmm] | HH:MM:SS[.mmm].
         #[arg(long)]
         playlist: Option<PathBuf>,
@@ -135,7 +137,7 @@ enum Cmd {
     },
     /// Size/seek frontier: project stream size and worst seek latency per gop.
     Plan {
-        /// Input IVF (same contract as expand), or `-` for stdin.
+        /// Input (same contract as expand: IVF / OBU / Annex-B), or `-` for stdin.
         #[arg(short, long)]
         input: PathBuf,
         /// Output frame rate (overrides input timebase).
@@ -149,7 +151,7 @@ enum Cmd {
     /// IVF (keyframe + golden). With --verbose / --check it analyzes an
     /// assembled stillcast stream TU by TU.
     Info {
-        /// Input path (.ivf or .mp4), or `-` for stdin.
+        /// Input path (.ivf/.obu/.av1b natively; .mp4 etc. via ffmpeg), or `-` for stdin.
         #[arg(short, long)]
         input: PathBuf,
         /// Per-TU dump: frame type, show_existing target, refreshed slots,
@@ -655,31 +657,36 @@ fn probe_meta(
     meta
 }
 
-/// Load every input IVF and extract (key TU, golden TU) pairs.
-/// Returns the geometry-donor IVF (segment 0) plus the pairs.
+/// Load every input (IVF / OBU / Annex-B) and extract (key TU, golden TU)
+/// pairs. Returns the geometry-donor input (segment 0), its detected
+/// format, and the pairs.
+#[allow(clippy::type_complexity)]
 fn load_pairs(
     paths: &[PathBuf],
 ) -> Result<(
     stillcast::ivf::IvfFile,
+    stillcast::container::Format,
     Vec<(
         stillcast::assemble::TemporalUnit,
         stillcast::assemble::TemporalUnit,
     )>,
 )> {
     let mut donor = None;
+    let mut donor_format = stillcast::container::Format::Ivf;
     let mut pairs = Vec::new();
     for p in paths {
         let data = read_input(p)?;
-        let ivf =
-            stillcast::ivf::read(&data).with_context(|| format!("parsing {}", p.display()))?;
-        let pair = stillcast::assemble::split_input(&ivf)
+        let input = stillcast::container::read(&data)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        let pair = stillcast::assemble::split_input(&input.ivf)
             .with_context(|| format!("splitting {}", p.display()))?;
         if donor.is_none() {
-            donor = Some(ivf);
+            donor = Some(input.ivf);
+            donor_format = input.format;
         }
         pairs.push(pair);
     }
-    Ok((donor.context("no inputs")?, pairs))
+    Ok((donor.context("no inputs")?, donor_format, pairs))
 }
 
 /// Grow gop geometrically until the produced file fits `max_bytes`.
@@ -811,7 +818,7 @@ fn main() -> Result<()> {
                     encode_still(&e.path, fps, *c, &p)?;
                     srcs.push(p);
                 }
-                let (donor, pairs) = load_pairs(&srcs)?;
+                let (donor, _fmt, pairs) = load_pairs(&srcs)?;
                 match build_output(
                     &donor,
                     &pairs,
@@ -880,10 +887,10 @@ fn main() -> Result<()> {
                     },
                 }],
                 (None, Some(pl)) => read_playlist(pl)?,
-                _ => anyhow::bail!("need -i <ivf> or --playlist <file>"),
+                _ => anyhow::bail!("need -i <input> or --playlist <file>"),
             };
             let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
-            let (donor, pairs) = load_pairs(&paths)?;
+            let (donor, donor_format, pairs) = load_pairs(&paths)?;
             let eff_fps = fps.unwrap_or_else(|| {
                 donor
                     .timebase_den
@@ -891,6 +898,14 @@ fn main() -> Result<()> {
                     .unwrap_or(30)
                     .max(1)
             });
+            if donor_format != stillcast::container::Format::Ivf && fps.is_none() {
+                eprintln!(
+                    "note: {:?} input has no container timebase; using {} fps \
+                     (from the sequence header's timing_info, else 30) — \
+                     pass --fps to override",
+                    donor_format, eff_fps
+                );
+            }
             let gop = resolve_gop(gop, target_seek, eff_fps);
             let is_mp4 = is_mp4_path(&output);
             anyhow::ensure!(
@@ -1012,7 +1027,9 @@ fn main() -> Result<()> {
             duration,
         } => {
             let data = read_input(&input)?;
-            let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
+            let input_fmt =
+                stillcast::container::read(&data).context("parsing input (IVF / OBU / Annex-B)")?;
+            let ivf = input_fmt.ivf;
             let (key_tu, golden_tu) =
                 stillcast::assemble::split_input(&ivf).context("splitting input")?;
             let eff_fps = fps.unwrap_or_else(|| {
@@ -1069,30 +1086,35 @@ fn main() -> Result<()> {
             verbose,
             check,
         } => {
-            let mut data = read_input(&input)?;
-            if (verbose || check) && !data.starts_with(b"DKIF") {
-                // Non-IVF input (e.g. mp4): demux the video to IVF first.
-                // stdin input has no path for ffmpeg, so stage it.
-                let staged;
-                let src = if is_stdio(&input) {
-                    staged = std::env::temp_dir().join("stillcast-info-src.mp4");
-                    std::fs::write(&staged, &data).context("staging stdin")?;
-                    &staged
-                } else {
-                    &input
-                };
-                let tmp = std::env::temp_dir().join("stillcast-info.ivf");
-                run(
-                    Command::new("ffmpeg")
-                        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-                        .arg(src)
-                        .args(["-map", "0:v:0", "-c:v", "copy", "-f", "ivf"])
-                        .arg(&tmp),
-                    "ffmpeg demux to ivf",
-                )?;
-                data = std::fs::read(&tmp).context("reading demuxed ivf")?;
-            }
-            let ivf = stillcast::ivf::read(&data).context("parsing input IVF")?;
+            let data = read_input(&input)?;
+            // Native containers (IVF / OBU / Annex-B) parse directly;
+            // anything else (mp4, mkv, ...) is demuxed to IVF via ffmpeg.
+            let ivf = match stillcast::container::read(&data) {
+                Ok(inp) => inp.ivf,
+                Err(native_err) => {
+                    // stdin input has no path for ffmpeg, so stage it.
+                    let staged;
+                    let src = if is_stdio(&input) {
+                        staged = std::env::temp_dir().join("stillcast-info-src.mp4");
+                        std::fs::write(&staged, &data).context("staging stdin")?;
+                        &staged
+                    } else {
+                        &input
+                    };
+                    let tmp = std::env::temp_dir().join("stillcast-info.ivf");
+                    run(
+                        Command::new("ffmpeg")
+                            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+                            .arg(src)
+                            .args(["-map", "0:v:0", "-c:v", "copy", "-f", "ivf"])
+                            .arg(&tmp),
+                        "ffmpeg demux to ivf",
+                    )
+                    .with_context(|| format!("{native_err:#}"))?;
+                    let demuxed = std::fs::read(&tmp).context("reading demuxed ivf")?;
+                    stillcast::ivf::read(&demuxed).context("parsing demuxed IVF")?
+                }
+            };
             if verbose || check {
                 let rep = stillcast::inspect::analyze(&ivf).context("analyzing stream")?;
                 let sh = &rep.seq_header;
