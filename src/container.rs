@@ -25,6 +25,7 @@ use crate::bitio::{leb128_encode, BitReader};
 use crate::ivf::{self, IvfFile};
 use crate::obu::{parse_obus, Obu, ObuType};
 use crate::seq_header;
+use crate::uheader::{self, Dpb};
 
 /// Detected input container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,15 +106,35 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
         frames.push((i as u64, out));
     }
     let sh = seq_header_found.context("input carries no sequence header OBU")?;
-    let fps = if sh.timing_info_present && sh.num_units_in_display_tick > 0 {
-        (sh.time_scale / sh.num_units_in_display_tick).max(1)
+    let fps = if sh.timing_info_present
+        && sh.equal_picture_interval
+        && sh.num_units_in_display_tick > 0
+    {
+        let ticks_per_picture = sh
+            .num_ticks_per_picture_minus_1
+            .checked_add(1)
+            .context("ticks per picture overflow")?;
+        let frame_period = u64::from(sh.num_units_in_display_tick)
+            .checked_mul(ticks_per_picture)
+            .context("frame period overflow")?;
+        (u64::from(sh.time_scale) / frame_period).max(1) as u32
     } else {
         30
     };
+
+    let first_frame = parse_obus(&frames[0].1)?
+        .into_iter()
+        .find(|obu| matches!(obu.obu_type, ObuType::Frame | ObuType::FrameHeader))
+        .context("first temporal unit carries no coded frame")?;
+    let scan = uheader::scan_uncompressed_header(&first_frame.payload, &sh, &mut Dpb::default())
+        .context("first temporal unit: bad uncompressed header")?;
+    let width = u16::try_from(scan.upscaled_width).context("frame width exceeds IVF limit")?;
+    let height = u16::try_from(scan.frame_height).context("frame height exceeds IVF limit")?;
+
     Ok(Input {
         ivf: IvfFile {
-            width: sh.max_frame_width as u16,
-            height: sh.max_frame_height as u16,
+            width,
+            height,
             timebase_den: fps,
             timebase_num: 1,
             frames,
