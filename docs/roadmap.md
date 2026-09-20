@@ -115,10 +115,12 @@ layer split keeps cheap.
 
 The 2-frame requirement is spec-derived (keyframes can never be re-shown
 via `show_existing_frame`), but positional acceptance (`packet 0`/`packet
-1`) is an implementation choice — and the fragile one for encoders that
-can't be configured (WebCodecs, HW/platform encoders, load-adaptive
-runtimes that silently drop frames). Direction: scan a bounded TU window
-for an anchor (seq header + shown KF) and a golden (shown, non-key,
-showable, refreshes ≥1 slot, `order_hint == anchor + 1`); encode ~1 s of
-input frames for drop tolerance; probe-verify per environment. Full
-analysis: [`docs/input-contract.md`](input-contract.md).
+1`) was the fragile part for encoders that can't be configured (WebCodecs,
+HW/platform encoders, load-adaptive runtimes that silently drop frames).
+Implemented: `split_input` scans a bounded TU window for an anchor
+(seq header + shown KF) and a golden (shown, non-key, showable, refreshes
+≥1 slot, `order_hint == anchor + 1` when hints exist), skipping junk TUs
+with per-TU "nearest miss" diagnostics. Remaining direction: encode ~1 s
+of input frames for drop tolerance (already the `encode` recipe);
+probe-verify per environment. Full analysis:
+[`docs/input-contract.md`](input-contract.md).

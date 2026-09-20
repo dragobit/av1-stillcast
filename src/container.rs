@@ -122,12 +122,75 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
         30
     };
 
-    let first_frame = parse_obus(&frames[0].1)?
-        .into_iter()
-        .find(|obu| matches!(obu.obu_type, ObuType::Frame | ObuType::FrameHeader))
-        .context("first temporal unit carries no coded frame")?;
-    let scan = uheader::scan_uncompressed_header(&first_frame.payload, &sh, &mut Dpb::default())
-        .context("first temporal unit: bad uncompressed header")?;
+    // Geometry comes from the first TU carrying a decodable coded frame:
+    // show_existing TUs carry no picture (the uncompressed-header walker
+    // rejects them), frames before any sequence header can't be parsed, and
+    // leading frameless TUs (metadata/padding) yield nothing. Skip those so
+    // junk-leading inputs still reach `split_input`'s scan, which reports
+    // the real diagnostics.
+    let mut sh_run = None;
+    let mut dpb = Dpb::default();
+    let mut scan = None;
+    let mut last_frame_err = String::new();
+    'tus: for (i, tu) in frames.iter().enumerate() {
+        let Ok(obus) = parse_obus(&tu.1) else {
+            continue;
+        };
+        for obu in &obus {
+            match obu.obu_type {
+                ObuType::SequenceHeader => {
+                    if let Ok(p) = seq_header::parse_sequence_header(&obu.payload) {
+                        sh_run = Some(p);
+                    }
+                }
+                ObuType::Frame | ObuType::FrameHeader => {
+                    let Some(sh) = &sh_run else { break };
+                    match crate::frame_header::parse_frame_header_info(&obu.payload, sh) {
+                        Ok(info) if info.show_existing_frame => {}
+                        Ok(info) => {
+                            match uheader::scan_uncompressed_header(&obu.payload, sh, &mut dpb) {
+                                Ok(s) => {
+                                    // Prefer an intra-coded frame for
+                                    // geometry — it carries its own size.
+                                    // An inter scanned against an empty DPB
+                                    // can read zero-sized ref slots.
+                                    let intra = matches!(
+                                        info.frame_type,
+                                        Some(
+                                            crate::frame_header::KEY_FRAME
+                                                | crate::frame_header::INTRA_ONLY_FRAME
+                                        )
+                                    );
+                                    if intra || scan.is_none() {
+                                        scan = Some(s);
+                                    }
+                                    if intra {
+                                        break 'tus;
+                                    }
+                                }
+                                Err(e) => {
+                                    last_frame_err =
+                                        format!("TU {i}: bad uncompressed header: {e:#}")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_frame_err = format!("TU {i}: frame header unreadable: {e:#}")
+                        }
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let scan = scan.with_context(|| {
+        if last_frame_err.is_empty() {
+            "no temporal unit carries a decodable coded frame".to_string()
+        } else {
+            format!("no decodable coded frame found ({last_frame_err})")
+        }
+    })?;
     let width = u16::try_from(scan.upscaled_width).context("frame width exceeds IVF limit")?;
     let height = u16::try_from(scan.frame_height).context("frame height exceeds IVF limit")?;
 

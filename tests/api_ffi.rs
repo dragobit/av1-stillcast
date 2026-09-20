@@ -4,8 +4,52 @@
 
 use stillcast::api::{expand_ivf, expand_ivf_multi, ExpandParams, SegmentInput};
 use stillcast::ivf;
+use stillcast::obu::{Obu, ObuType};
 
 const SRC: &[u8] = include_bytes!("fixtures/src.ivf");
+
+fn src_tus() -> Vec<Vec<u8>> {
+    ivf::read(SRC)
+        .unwrap()
+        .frames
+        .into_iter()
+        .map(|(_, tu)| tu)
+        .collect()
+}
+
+/// A temporal unit with no coded frame (TD + metadata + padding).
+fn junk_tu() -> Vec<u8> {
+    let mut tu = Vec::new();
+    Obu::temporal_delimiter().write(&mut tu);
+    Obu {
+        obu_type: ObuType::Metadata,
+        extension: None,
+        payload: vec![0, 0, 0xaa],
+    }
+    .write(&mut tu);
+    Obu {
+        obu_type: ObuType::Padding,
+        extension: None,
+        payload: vec![0; 4],
+    }
+    .write(&mut tu);
+    tu
+}
+
+fn ivf_bytes(tus: &[Vec<u8>]) -> Vec<u8> {
+    ivf::write(&ivf::IvfFile {
+        width: 640,
+        height: 640,
+        timebase_den: 30,
+        timebase_num: 1,
+        frames: tus
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, t)| (i as u64, t))
+            .collect(),
+    })
+}
 
 #[test]
 fn expand_ivf_produces_gop_pattern() {
@@ -107,6 +151,83 @@ fn expand_accepts_obu_and_annexb_inputs() {
         let out = expand_ivf(&bytes, &params).unwrap();
         assert_eq!(out, expected);
     }
+}
+
+#[test]
+fn expand_scans_past_leading_junk_tus() {
+    // Condition-based acceptance: a leading frameless TU (metadata/padding)
+    // doesn't displace the anchor+golden pair. For IVF and Annex-B the junk
+    // TU is skipped entirely, so output stays byte-identical; the OBU-stream
+    // demuxer merges leading frameless OBUs into the first coded TU, so
+    // there it only has to succeed.
+    let mut tus = vec![junk_tu()];
+    tus.extend(src_tus());
+    let params = ExpandParams {
+        fps: Some(30),
+        total_frames: 60,
+        gop_size: 30,
+        decoder_model: false,
+    };
+    let expected = expand_ivf(SRC, &params).unwrap();
+    for bytes in [ivf_bytes(&tus), stillcast::container::write_annexb(&tus)] {
+        let out = expand_ivf(&bytes, &params).unwrap();
+        assert_eq!(out, expected);
+    }
+    let out = expand_ivf(&stillcast::container::write_obu_stream(&tus), &params).unwrap();
+    assert_eq!(ivf::read(&out).unwrap().frames.len(), 60);
+}
+
+#[test]
+fn expand_multi_scans_each_segment_source() {
+    // Playlist path: segment 2's input carries the pair at non-zero offsets
+    // (junk TU in front, trailing coded frames behind). Both sources get the
+    // same scan.
+    let mut offset = vec![junk_tu()];
+    offset.extend(src_tus());
+    let offset = ivf_bytes(&offset);
+    let out = expand_ivf_multi(
+        &[
+            SegmentInput {
+                ivf: SRC,
+                frames: 2,
+            },
+            SegmentInput {
+                ivf: &offset,
+                frames: 2,
+            },
+        ],
+        &ExpandParams {
+            fps: None,
+            total_frames: 4,
+            gop_size: 30,
+            decoder_model: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(ivf::read(&out).unwrap().frames.len(), 4);
+}
+
+#[test]
+fn expand_rejects_all_keyframe_input() {
+    // -g 1 style: seq+KF on every TU — nearest-miss diagnostics must name
+    // the forced keyframes.
+    let src = src_tus();
+    let mut tus = Vec::new();
+    for _ in 0..3 {
+        tus.push(src[0].clone());
+    }
+    let err = expand_ivf(
+        &ivf_bytes(&tus),
+        &ExpandParams {
+            fps: None,
+            total_frames: 10,
+            gop_size: 10,
+            decoder_model: false,
+        },
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("KEY_FRAME"), "{msg}");
 }
 
 #[test]

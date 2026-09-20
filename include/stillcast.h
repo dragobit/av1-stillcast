@@ -1,8 +1,9 @@
 /* stillcast C ABI — thin shim over the Rust core.
  *
- * Contract: bytes in -> bytes out. Input is a complete IVF file whose first
- * packet is a keyframe TU (with sequence header) and second is the golden
- * inter TU, as produced by `stillcast encode` or a libaom 2-frame encode.
+ * Contract: bytes in -> bytes out. Input is a complete IVF / OBU / Annex-B
+ * encode whose leading temporal units are scanned for a keyframe-anchor TU
+ * (sequence header + shown KEY_FRAME) and the golden TU coded right after
+ * it — as produced by `stillcast encode` or a libaom ~1s still encode.
  * Output is a complete expanded IVF file.
  *
  * Build the shared/static lib with `cargo build --release`; artifacts are

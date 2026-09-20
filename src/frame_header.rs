@@ -27,6 +27,9 @@ pub struct FrameHeaderInfo {
     pub show_frame: bool,
     pub showable_frame: bool,
     pub refresh_frame_flags: u8,
+    /// The frame's order_hint (display-order hint). 0 for show_existing_frame
+    /// headers, which carry none — the stored frame's hint is what counts.
+    pub order_hint: u64,
 }
 
 impl FrameHeaderInfo {
@@ -64,6 +67,7 @@ pub fn parse_frame_header_info(payload: &[u8], sh: &SequenceHeader) -> Result<Fr
             show_frame: false,
             showable_frame: false,
             refresh_frame_flags: 0,
+            order_hint: 0,
         });
     }
 
@@ -100,7 +104,7 @@ pub fn parse_frame_header_info(payload: &[u8], sh: &SequenceHeader) -> Result<Fr
     if frame_type != SWITCH_FRAME && !sh.reduced_still_picture_header {
         r.f(1)?; // frame_size_override_flag
     }
-    r.f(sh.order_hint_bits)?; // order_hint
+    let order_hint = r.f(sh.order_hint_bits)?;
 
     if !frame_is_intra && !error_resilient {
         r.f(3)?; // primary_ref_frame
@@ -133,5 +137,6 @@ pub fn parse_frame_header_info(payload: &[u8], sh: &SequenceHeader) -> Result<Fr
         show_frame,
         showable_frame,
         refresh_frame_flags,
+        order_hint,
     })
 }

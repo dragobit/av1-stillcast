@@ -15,8 +15,9 @@ decision on which other containers `expand`/`plan`/`info` should accept.
   but it is just one adapter.** It sits on top of `libstillcast` via the C
   ABI, alongside the CLI and any other frontends — it is not "the" product.
 - **The transform itself is already container-agnostic.** `split_input`
-  needs only a TU byte sequence (`packet 0` = seq header + shown keyframe,
-  `packet 1` = shown inter golden) plus width/height and an fps hint.
+  scans the leading TUs for the anchor (seq header + shown keyframe) and
+  the golden (the shown non-key frame coded right after it) — positions are
+  never hard-coded — plus width/height and an fps hint.
 
 ## Candidates evaluated
 

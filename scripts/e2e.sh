@@ -185,6 +185,16 @@ cargo run --quiet -- assemble -i "$WORK/src.ivf" -o "$WORK/b.mp4" \
 cmp "$WORK/a.mp4" "$WORK/b.mp4"
 echo "deterministic OK"
 
+echo "== input scan: all-keyframe input rejected with per-TU diagnostics"
+ffmpeg -hide_banner -loglevel error -loop 1 -i "$WORK/still.png" \
+    -vf format=yuv420p -c:v libaom-av1 -crf 32 -b:v 0 -cpu-used 8 \
+    -r 30 -g 1 -frames:v 4 "$WORK/allkf.ivf"
+if cargo run --quiet -- assemble -i "$WORK/allkf.ivf" -o "$WORK/x.ivf" \
+    --frames 30 2> "$WORK/kf.err"; then
+    echo "all-keyframe input unexpectedly accepted"; exit 1
+fi
+grep -q "KEY_FRAME" "$WORK/kf.err"
+
 echo "== speed check: assemble 1 hour @30fps"
 time cargo run --quiet --release -- assemble -i "$WORK/src.ivf" \
     -o "$WORK/big.ivf" --duration 3600 --gop 300
