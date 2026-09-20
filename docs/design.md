@@ -102,6 +102,10 @@ golden (a shown inter frame is what libaom emits for identical content).
 Rejected up front: reduced still-picture headers, frame id numbers,
 unequal-interval decoder-model timing, film grain.
 
+How the contract holds under encoders/environments that can't be
+configured (and how positional acceptance should evolve into condition
+scanning): [`docs/input-contract.md`](input-contract.md).
+
 ## MP4 output
 
 Layout is `ftyp | moov | mdat` (faststart: moov first, via a two-pass

@@ -110,3 +110,16 @@ Beyond a single tool/distribution: a VP9 variant (VP9 also has
 `show_existing_frame`, reaching older AV1-less hardware) and library
 embedding for server-side on-demand generation are open possibilities the
 layer split keeps cheap.
+
+## 5. Input-contract hardening
+
+The 2-frame requirement is spec-derived (keyframes can never be re-shown
+via `show_existing_frame`), but positional acceptance (`packet 0`/`packet
+1`) is an implementation choice — and the fragile one for encoders that
+can't be configured (WebCodecs, HW/platform encoders, load-adaptive
+runtimes that silently drop frames). Direction: scan a bounded TU window
+for an anchor (seq header + shown KF) and a golden (shown, non-key,
+showable, refreshes ≥1 slot, `order_hint == anchor + 1`); encode ~1 s of
+input frames for drop tolerance; probe-verify per environment. Full
+analysis and the single-frame/AVIF feasibility ladder:
+[`docs/input-contract.md`](input-contract.md).
