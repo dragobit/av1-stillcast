@@ -76,7 +76,8 @@ pub fn parse(data: &[u8]) -> Result<AdtsStream> {
                     ((freq_idx & 1) << 7) | (chan_cfg << 3),
                 ]);
                 sample_rate = rate;
-                channels = u16::from(chan_cfg);
+                // chan_cfg is a layout index, not a count: 7 is 7.1 (8ch).
+                channels = u16::from(if chan_cfg == 7 { 8 } else { chan_cfg });
             }
         }
 
@@ -141,5 +142,13 @@ mod tests {
         assert_eq!(s.channels, 2);
         assert_eq!(s.frames.len(), 1);
         assert_eq!(s.frames[0], [0xaa; 4]);
+    }
+
+    #[test]
+    fn channel_config_7_is_eight_channels() {
+        // ADTS channel_configuration is a layout index: 7 means 7.1, i.e.
+        // 8 channels in the mp4 channelcount field.
+        let s = parse(&adts_frame(&[0xaa; 4], 4, 7)).unwrap();
+        assert_eq!(s.channels, 8);
     }
 }
