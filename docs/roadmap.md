@@ -121,5 +121,4 @@ runtimes that silently drop frames). Direction: scan a bounded TU window
 for an anchor (seq header + shown KF) and a golden (shown, non-key,
 showable, refreshes ≥1 slot, `order_hint == anchor + 1`); encode ~1 s of
 input frames for drop tolerance; probe-verify per environment. Full
-analysis and the single-frame/AVIF feasibility ladder:
-[`docs/input-contract.md`](input-contract.md).
+analysis: [`docs/input-contract.md`](input-contract.md).
