@@ -1,4 +1,4 @@
-# https://docs.devin.ai/onboard-devin/environment-yaml
+# One-time setup (e.g., install system tools, global CLIs).
 initialize: |
   # Rust toolchain + ffmpeg (e2e encode/decode verification) + playwright
   # + player binaries (compat_players.sh) + playwright firefox build
@@ -17,6 +17,7 @@ initialize: |
       -DENABLE_EXAMPLES=0 -DENABLE_TOOLS=1
     cmake --build ~/work/aom/build --target aomdec dump_obu -j"$(nproc)"
   fi
+# Install project dependencies (runs during builds, surfaced to agent at session start).
 maintenance: |
   cargo fetch
 knowledge:
@@ -28,7 +29,7 @@ knowledge:
       cargo test && ./scripts/e2e.sh
   - name: browser-test
     contents: |
-      CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/demo.mp4
+      BROWSER=chrome CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/demo.mp4
   - name: notes
     contents: |
       ffmpeg provides libaom-av1 (encode) and libdav1d (decode-verify); the e2e
