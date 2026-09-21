@@ -378,11 +378,14 @@ pub fn to_ivf(src: &IvfFile, tus: Vec<TemporalUnit>, fps: Option<u32>) -> IvfFil
     }
 }
 
-/// How many leading temporal units `split_input` scans for the
-/// (anchor keyframe, golden) pair. Encoders are asked for ~1 s of frames so
-/// dropped or leading invisible frames are survivable; the bound keeps
-/// acceptance from depending on the input's tail.
-pub const INPUT_SCAN_TUS: usize = 8;
+/// Hard cap on how many leading temporal units `split_input` scans for the
+/// (anchor keyframe, golden) pair. This is *not* a semantic bound: any later
+/// TU is a valid candidate, so the scan runs until the pair is found or the
+/// input runs out. The cap only guards pathological inputs — every scanned TU
+/// is OBU-parsed and logged into the failure diagnostics, so an unbounded
+/// scan could burn real work and emit an unbounded error report on a stream
+/// that never yields a pair.
+pub const INPUT_SCAN_LIMIT: usize = 256;
 
 /// What the scan classifies one temporal unit as.
 enum ScannedTu {
@@ -483,9 +486,9 @@ fn classify_tu(
 }
 
 /// Extract (key TU, golden TU) from a coded stream produced by a real
-/// encoder. Instead of requiring packets 0 and 1 positionally, this scans a
-/// bounded window ([`INPUT_SCAN_TUS`]) and tests each TU against the actual
-/// contract conditions:
+/// encoder. Instead of requiring packets 0 and 1 positionally, this scans
+/// leading TUs — bounded only by [`INPUT_SCAN_LIMIT`] as a pathological-input
+/// guard — and tests each TU against the actual contract conditions:
 ///
 /// - **anchor**: contains the sequence header OBU and a shown KEY_FRAME.
 ///   A later seq+KEY_FRAME TU re-anchors the search (multi-keyframe
@@ -506,7 +509,7 @@ fn classify_tu(
 /// the error lists per-TU why each candidate missed.
 pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
     anyhow::ensure!(!ivf.frames.is_empty(), "input carries no temporal units");
-    let window = ivf.frames.len().min(INPUT_SCAN_TUS);
+    let scan_limit = ivf.frames.len().min(INPUT_SCAN_LIMIT);
 
     let mut sh: Option<SequenceHeader> = None;
     let mut sh_raw: Option<Vec<u8>> = None;
@@ -528,7 +531,7 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
     let mut n_anchors = 0usize;
     let mut key_only = true; // every parsed coded frame so far is a KEY_FRAME
 
-    for (i, (_, tu)) in ivf.frames.iter().enumerate().take(window) {
+    for (i, (_, tu)) in ivf.frames.iter().enumerate().take(scan_limit) {
         let (scan, seq_changed) = classify_tu(tu, &mut sh, &mut sh_raw);
         // A different sequence header mid-window orphans an anchor taken
         // under the previous one — unless this same TU re-anchors under it.
@@ -725,11 +728,18 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
         return Ok((ivf.frames[ai].1.clone(), ivf.frames[gi].1.clone()));
     }
 
+    let scanned = lines.len();
     let mut msg = format!(
-        "no usable keyframe+golden pair in the first {window} temporal unit(s) \
-         (input has {}):",
+        "no usable keyframe+golden pair — scanned {scanned} leading temporal \
+         unit(s) of {}",
         ivf.frames.len()
     );
+    if ivf.frames.len() > scanned {
+        msg.push_str(&format!(
+            " (stopped at the INPUT_SCAN_LIMIT={INPUT_SCAN_LIMIT} guard)"
+        ));
+    }
+    msg.push(':');
     for line in &lines {
         msg.push_str(&format!("\n  {line}"));
     }
@@ -749,7 +759,7 @@ pub fn split_input(ivf: &IvfFile) -> Result<(TemporalUnit, TemporalUnit)> {
                  with refresh_frame_flags != 0{adjacency}"
             ));
             if after_anchor.0 == 0 && n_anchors <= 1 {
-                msg.push_str(" — no coded frame follows it in the window");
+                msg.push_str(" — no coded frame follows it in the scanned TUs");
             } else if key_only {
                 msg.push_str(
                     " — every coded frame in the window is a KEY_FRAME \
@@ -1061,15 +1071,50 @@ mod tests {
     }
 
     #[test]
-    fn window_is_bounded() {
-        // The golden one TU past the window is not seen.
+    fn finds_pair_buried_behind_many_junk_tus() {
+        // Regression for the old fixed 8-TU window: leading junk TUs
+        // (redundant sequence headers, metadata/padding, TD-only) must not
+        // bury the anchor+golden pair.
+        let src = src_tus();
+        let mut tus = Vec::new();
+        for i in 0..12 {
+            tus.push(if i % 2 == 0 {
+                seq_only_tu()
+            } else {
+                meta_padding_tu()
+            });
+        }
+        tus.push(src[0].clone());
+        tus.push(src[1].clone());
+        let (k, g) = split_input(&ivf_of(tus)).unwrap();
+        assert_eq!(k, src[0]);
+        assert_eq!(g, src[1]);
+        // The recovered pair expands normally.
+        let params = AssembleParams {
+            fps: 30,
+            fps_den: 1,
+            total_frames: 8,
+            gop_size: 8,
+            decoder_model: false,
+        };
+        let out = assemble(&k, &g, &params).unwrap();
+        assert_eq!(out.tus.len(), 8);
+        assert_eq!(out.key_samples, vec![1]);
+    }
+
+    #[test]
+    fn scan_stops_at_the_guard_limit() {
+        // The golden one TU past the guard cap is not seen; the error reports
+        // how many leading TUs were scanned and that the cap was hit.
         let src = src_tus();
         let mut tus = vec![src[0].clone()];
-        for _ in 1..INPUT_SCAN_TUS {
+        for _ in 1..INPUT_SCAN_LIMIT {
             tus.push(show_existing_tu(0));
         }
         tus.push(src[1].clone());
         let err = split_input(&ivf_of(tus)).unwrap_err().to_string();
+        assert!(err.contains("scanned 256 leading"), "{err}");
+        assert!(err.contains("INPUT_SCAN_LIMIT"), "{err}");
         assert!(err.contains("no coded frame follows"), "{err}");
     }
 

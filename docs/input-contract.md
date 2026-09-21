@@ -8,8 +8,9 @@ control (WebCodecs, hardware encoders, platform APIs) can feed it.
 
 ## The contract, restated as conditions
 
-**Implemented:** `split_input` scans a bounded window (`INPUT_SCAN_TUS` =
-the first 8 TUs) and tests per-TU *conditions*, not positions:
+**Implemented:** `split_input` scans leading TUs (bounded only by
+`INPUT_SCAN_LIMIT` = 256 as a pathological-input guard, not a semantic
+limit) and tests per-TU *conditions*, not positions:
 
 - **anchor TU** — contains the sequence header and a shown `KEY_FRAME`
   (decoder reset + random-access point; all 8 ref slots refresh to it).
@@ -35,7 +36,7 @@ qualifies, the error lists every scanned TU and *why* it missed (e.g.
 order_hint=5 vs TU0+1=1 — coded against other frames`, `TU3: preceded
 by coded TU2; decode state after splicing is unverifiable`).
 
-A sequence header whose bytes *change* mid-window invalidates a prior
+A sequence header whose bytes *change* mid-scan invalidates a prior
 anchor — the key TU returned and the golden must parse under the same
 header. A same-TU seq+keyframe still re-anchors under the new header;
 identical re-emitted headers change nothing.
@@ -104,7 +105,8 @@ is runtimes that reshape the TU stream around the two packets:
 Positional acceptance was the fragile part. Status of the fix that
 dissolves per-encoder dependence:
 
-1. **Done** — `split_input` scans a bounded window (first 8 TUs) for the
+1. **Done** — `split_input` scans leading TUs (bounded only by the
+   `INPUT_SCAN_LIMIT` guard) for the
    anchor TU, then the golden TU under the conditions above — decode-order
    adjacency (no slot-refreshing coded frame between it and its
    predecessor) plus `order_hint == predecessor + 1` when the stream
