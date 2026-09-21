@@ -15,8 +15,9 @@
 //! plus edit-list/fmp4 edge cases). `stillcast info` additionally accepts
 //! them by delegating the demux to ffmpeg.
 //!
-//! Non-IVF inputs carry no reliable container timebase: fps is derived from
-//! the sequence header's `timing_info` when present, else defaults to 30 —
+//! Non-IVF inputs carry no reliable container timebase: the rate is derived
+//! from the sequence header's `timing_info` when present (kept as an exact
+//! rational — 30000/1001 stays 30000/1001), else defaults to 30/1 —
 //! pass `--fps` to override.
 
 use anyhow::{bail, Context, Result};
@@ -116,20 +117,27 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
         frames.push((i as u64, out));
     }
     let sh = seq_header_found.context("input carries no sequence header OBU")?;
-    let fps = if sh.timing_info_present
+    // The declared rate, kept as an exact rational (time_scale /
+    // frame_period) instead of a truncated integer fps — a 30000/1001
+    // stream must not become "29 fps". Reduced so IVF's u32 fields hold
+    // it; anything still too large is pathological and falls back to
+    // the unset default.
+    let (timebase_den, timebase_num) = if sh.timing_info_present
         && sh.equal_picture_interval
         && sh.num_units_in_display_tick > 0
+        && sh.time_scale > 0
     {
-        let ticks_per_picture = sh
-            .num_ticks_per_picture_minus_1
-            .checked_add(1)
-            .context("ticks per picture overflow")?;
         let frame_period = u64::from(sh.num_units_in_display_tick)
-            .checked_mul(ticks_per_picture)
-            .context("frame period overflow")?;
-        (u64::from(sh.time_scale) / frame_period).max(1) as u32
+            .saturating_mul(sh.num_ticks_per_picture_minus_1.saturating_add(1));
+        let g = ivf::gcd(u64::from(sh.time_scale), frame_period);
+        let (d, n) = (u64::from(sh.time_scale) / g, frame_period / g);
+        if d <= u64::from(u32::MAX) && n <= u64::from(u32::MAX) {
+            (d as u32, n as u32)
+        } else {
+            (30, 1)
+        }
     } else {
-        30
+        (30, 1)
     };
 
     // Geometry comes from the first TU carrying a decodable coded frame:
@@ -208,8 +216,8 @@ fn finish(tus: Vec<Vec<u8>>, format: Format) -> Result<Input> {
         ivf: IvfFile {
             width,
             height,
-            timebase_den: fps,
-            timebase_num: 1,
+            timebase_den,
+            timebase_num,
             frames,
         },
         format,
@@ -603,6 +611,57 @@ mod tests {
 
     fn tu_contains(tu: &[u8], t: ObuType) -> bool {
         parse_obus(tu).unwrap().iter().any(|o| o.obu_type == t)
+    }
+
+    /// Rewrite TU 0's sequence header to declare timing_info with the given
+    /// (num_units_in_display_tick, time_scale, num_ticks_per_picture_minus_1).
+    fn retimed(mut packets: Vec<Vec<u8>>, units: u32, scale: u32, ticks_m1: u64) -> Vec<Vec<u8>> {
+        let mut tu0 = Vec::new();
+        for obu in parse_obus(&packets[0]).unwrap() {
+            if obu.obu_type == ObuType::SequenceHeader {
+                let mut sh = seq_header::parse_sequence_header(&obu.payload).unwrap();
+                sh.timing_info_present = true;
+                sh.equal_picture_interval = true;
+                sh.num_units_in_display_tick = units;
+                sh.time_scale = scale;
+                sh.num_ticks_per_picture_minus_1 = ticks_m1;
+                Obu {
+                    payload: seq_header::emit_sequence_header(&sh),
+                    ..obu
+                }
+                .write(&mut tu0);
+            } else {
+                obu.write(&mut tu0);
+            }
+        }
+        packets[0] = tu0;
+        packets
+    }
+
+    #[test]
+    fn non_ivf_inputs_keep_the_rational_rate() {
+        // NTSC 30000/1001 must survive demuxing exactly — the old integer
+        // division truncated it to 29, skewing every downstream duration.
+        for (units, scale, ticks_m1) in [
+            (1001, 30000, 0), // declared directly
+            (1001, 90000, 2), // 90 kHz clock, 3 ticks/picture — reduces
+            (1, 90000, 3002), // same thing, different factoring
+        ] {
+            let packets = retimed(ivf_packets(), units, scale, ticks_m1);
+            for bytes in [write_obu_stream(&packets), write_annexb(&packets)] {
+                let input = read(&bytes).unwrap();
+                assert_eq!(
+                    (input.ivf.timebase_den, input.ivf.timebase_num),
+                    (30000, 1001),
+                    "timing {scale}/{units}x{ticks_m1}"
+                );
+                assert_eq!(input.ivf.rate(), (30000, 1001));
+            }
+        }
+        // An ordinary integer rate still lands as (fps, 1).
+        let packets = retimed(ivf_packets(), 1, 30, 0);
+        let input = read(&write_obu_stream(&packets)).unwrap();
+        assert_eq!(input.ivf.rate(), (30, 1));
     }
 
     #[test]
