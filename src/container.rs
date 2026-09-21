@@ -319,8 +319,10 @@ fn write_tu(obus: &[Obu]) -> Vec<u8> {
 /// leading `[TD, seq header]` group in its own packet normalizes
 /// identically in either container. A packet carrying no coded frame is
 /// prepended to the next packet that has one; a trailing frameless packet
-/// attaches to the last real one. A merged packet keeps the first
-/// contributing packet's timestamp.
+/// attaches to the last real one. A merged packet keeps the coded
+/// packet's timestamp — a frameless packet has no display time of its
+/// own, so `pending_ts` only applies when the pending group is emitted
+/// standalone (no coded packet follows it).
 ///
 /// Packets that fail OBU framing pass through with the pending group
 /// flushed ahead of them — the downstream scan reports the real error.
@@ -335,7 +337,7 @@ fn merge_frameless_packets(frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
             } else {
                 let mut merged = write_tu(&pending);
                 merged.extend_from_slice(&tu);
-                out.push((pending_ts, merged));
+                out.push((ts, merged));
                 pending.clear();
             }
             continue;
@@ -344,7 +346,6 @@ fn merge_frameless_packets(frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
             .iter()
             .any(|o| matches!(o.obu_type, ObuType::Frame | ObuType::FrameHeader));
         if has_frame {
-            let ts = if pending.is_empty() { ts } else { pending_ts };
             out.push((ts, write_tu(&concat_tu(std::mem::take(&mut pending), obus))));
         } else {
             if pending.is_empty() {
@@ -678,9 +679,10 @@ mod tests {
         let input = read(&ivf::write(&ivf)).unwrap();
         assert_eq!(input.format, Format::Ivf);
         assert_eq!(input.ivf.frames.len(), packets.len());
-        // The merged TU keeps the first contributing packet's timestamp
-        // and a single leading TD ahead of the sequence header.
-        assert_eq!(input.ivf.frames[0].0, ts0);
+        // The merged TU keeps the coded packet's timestamp (the frameless
+        // packet has no display time of its own) and a single leading TD
+        // ahead of the sequence header.
+        assert_eq!(input.ivf.frames[0].0, ts0 + 1);
         assert_eq!(td_count(&input.ivf.frames[0].1), 1);
         let obus0 = parse_obus(&input.ivf.frames[0].1).unwrap();
         assert_eq!(obus0[0].obu_type, ObuType::TemporalDelimiter);
