@@ -76,7 +76,7 @@ enum Cmd {
     /// stdout, so it composes with ffmpeg in a shell pipeline.
     #[command(name = "expand", visible_alias = "assemble")]
     Expand {
-        /// Input: IVF / OBU stream / Annex-B. The first ~8 temporal units are
+        /// Input: IVF / OBU stream / Annex-B. Leading temporal units are
         /// scanned for a keyframe-anchor TU (seq header + shown KEY_FRAME)
         /// and the golden TU after it. `-` reads stdin. Mutually exclusive
         /// with --playlist.
