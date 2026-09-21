@@ -98,8 +98,9 @@ model across segments in decode order.
 ## Input contract
 
 Input is a short encode of the same static picture from a conformant
-encoder. `split_input` scans a bounded window (`INPUT_SCAN_TUS` = 8 leading
-TUs, positions never hard-coded) for the two TUs it needs:
+encoder. `split_input` scans leading TUs (positions never hard-coded;
+bounded only by `INPUT_SCAN_LIMIT` = 256 as a pathological-input guard)
+for the two TUs it needs:
 
 - **anchor** — a TU containing the sequence header and a shown keyframe;
 - **golden** — the first TU after the anchor that is shown, non-key,
