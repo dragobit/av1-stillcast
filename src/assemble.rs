@@ -38,6 +38,15 @@ pub struct AssembleParams {
 /// A temporal unit (the OBU payload sequence of one IVF packet).
 pub type TemporalUnit = Vec<u8>;
 
+/// Upper bound on the total output frame count a request may ask for.
+/// 5M frames ≈ 46h at 30fps — far beyond any real static video/podcast,
+/// so anything above it is a bug or an abusive request, not a use case.
+/// This is a parameter-sanity check, not an allocation guarantee: the
+/// assembled TU list is materialized in memory, so actual memory cost
+/// also depends on GOP size and TU payload sizes — requests near the cap
+/// can still fail on small machines.
+pub const MAX_TOTAL_FRAMES: u64 = 5_000_000;
+
 /// Locate the shown frame's header inside a TU and return its FrameHeaderInfo.
 fn tu_frame_info(tu: &[u8], sh: &SequenceHeader) -> Result<frame_header::FrameHeaderInfo> {
     for obu in parse_obus(tu)? {
@@ -185,6 +194,17 @@ pub fn assemble_multi(segments: &[Segment], params: &AssembleParams) -> Result<A
     anyhow::ensure!(
         params.gop_size >= 2,
         "gop size must be >= 2 (keyframe + golden)"
+    );
+    let total: u64 = segments
+        .iter()
+        .fold(0u64, |t, s| t.saturating_add(s.frames));
+    anyhow::ensure!(total >= 2, "need at least 2 output frames");
+    for (i, seg) in segments.iter().enumerate() {
+        anyhow::ensure!(seg.frames >= 1, "segment {i} requests 0 frames");
+    }
+    anyhow::ensure!(
+        total <= MAX_TOTAL_FRAMES,
+        "requested {total} output frames exceeds the {MAX_TOTAL_FRAMES} limit"
     );
 
     // --- canonical sequence header from segment 0; all segments must match ---

@@ -279,6 +279,115 @@ fn expand_treats_zero_timebase_as_unset() {
 }
 
 #[test]
+fn expand_ivf_rejects_degenerate_frame_counts() {
+    // The CLI contract (build_output): fewer than 2 output frames is an
+    // error, not a 0/1-packet IVF.
+    for total in [0u64, 1] {
+        let err = expand_ivf(
+            SRC,
+            &ExpandParams {
+                fps: None,
+                total_frames: total,
+                gop_size: 30,
+                decoder_model: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("at least 2 output frames"),
+            "total={total}: {err:#}"
+        );
+    }
+}
+
+#[test]
+fn expand_ivf_multi_rejects_zero_frame_segment() {
+    // A 0-frame segment contributes nothing — error instead of silently
+    // dropping the input.
+    let err = expand_ivf_multi(
+        &[
+            SegmentInput {
+                ivf: SRC,
+                frames: 0,
+            },
+            SegmentInput {
+                ivf: SRC,
+                frames: 5,
+            },
+        ],
+        &ExpandParams {
+            fps: None,
+            total_frames: 5,
+            gop_size: 30,
+            decoder_model: false,
+        },
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("requests 0 frames"), "{msg}");
+}
+
+#[test]
+fn expand_ivf_rejects_gop_below_two() {
+    // Same contract as the CLI's --gop: 0/1 error identically.
+    for gop in [0u64, 1] {
+        let err = expand_ivf(
+            SRC,
+            &ExpandParams {
+                fps: None,
+                total_frames: 10,
+                gop_size: gop,
+                decoder_model: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("gop size must be >= 2"),
+            "gop={gop}: {err:#}"
+        );
+    }
+}
+
+#[test]
+fn expand_rejects_frame_counts_above_the_assembly_bound() {
+    // The TU list is built in memory; pathological counts must error
+    // instead of aborting on OOM (also covers the FFI catch_unwind path).
+    let err = expand_ivf(
+        SRC,
+        &ExpandParams {
+            fps: None,
+            total_frames: stillcast::assemble::MAX_TOTAL_FRAMES + 1,
+            gop_size: 30,
+            decoder_model: false,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+
+    // Segment counts that overflow u64 in aggregate saturate, then error.
+    let err = expand_ivf_multi(
+        &[
+            SegmentInput {
+                ivf: SRC,
+                frames: u64::MAX / 2,
+            },
+            SegmentInput {
+                ivf: SRC,
+                frames: u64::MAX / 2,
+            },
+        ],
+        &ExpandParams {
+            fps: None,
+            total_frames: u64::MAX / 2 * 2,
+            gop_size: 30,
+            decoder_model: false,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+}
+
+#[test]
 fn expand_ivf_rejects_garbage() {
     assert!(expand_ivf(
         b"not ivf",

@@ -431,7 +431,9 @@ fn build_output(
         .filter(|&f| f > 0)
         .map(|f| (f, 1))
         .unwrap_or_else(|| ivf.rate());
-    let total: u64 = seg_frames.iter().sum();
+    // saturating: assemble_multi re-validates the total (incl. an upper
+    // bound); an unsaturating sum could overflow before that check runs.
+    let total: u64 = seg_frames.iter().fold(0u64, |t, &f| t.saturating_add(f));
     anyhow::ensure!(total >= 2, "need at least 2 output frames");
 
     let segs: Vec<stillcast::assemble::Segment> = pairs
@@ -761,6 +763,12 @@ fn main() -> Result<()> {
                 _ => anyhow::bail!("need -i <image> or --playlist <file>"),
             };
 
+            let is_mp4 = is_mp4_path(&output);
+            anyhow::ensure!(
+                audio.is_none() || is_mp4,
+                "--audio requires mp4 output (-o out.mp4)"
+            );
+
             let work = if keep_work {
                 output
                     .parent()
@@ -771,7 +779,6 @@ fn main() -> Result<()> {
             };
             std::fs::create_dir_all(&work)?;
 
-            let is_mp4 = is_mp4_path(&output);
             let aac = match &audio {
                 Some(a) if is_mp4 => Some(ensure_adts(a, &work, &audio_bitrate)?),
                 _ => None,
