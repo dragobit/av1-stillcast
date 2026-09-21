@@ -39,11 +39,13 @@ pub struct AssembleParams {
 pub type TemporalUnit = Vec<u8>;
 
 /// Upper bound on the total output frame count a request may ask for.
-/// 25M covers 24h+ at 240fps (~20.7M frames) — far beyond any real
-/// static video. The assembled TU list is materialized in memory
-/// (~50 B/frame), so above this a request is a bug or abuse: without the
-/// cap it would abort on OOM instead of returning an error.
-pub const MAX_TOTAL_FRAMES: u64 = 25_000_000;
+/// 5M frames ≈ 46h at 30fps — far beyond any real static video/podcast,
+/// so anything above it is a bug or an abusive request, not a use case.
+/// This is a parameter-sanity check, not an allocation guarantee: the
+/// assembled TU list is materialized in memory, so actual memory cost
+/// also depends on GOP size and TU payload sizes — requests near the cap
+/// can still fail on small machines.
+pub const MAX_TOTAL_FRAMES: u64 = 5_000_000;
 
 /// Locate the shown frame's header inside a TU and return its FrameHeaderInfo.
 fn tu_frame_info(tu: &[u8], sh: &SequenceHeader) -> Result<frame_header::FrameHeaderInfo> {
