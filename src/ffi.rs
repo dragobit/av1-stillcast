@@ -35,7 +35,8 @@ pub extern "C" fn stillcast_last_error() -> *const std::ffi::c_char {
 ///
 /// Returns a malloc'd buffer of `*out_len` bytes (free with
 /// `stillcast_free`), or NULL on error (see `stillcast_last_error`).
-/// `fps == 0` keeps the input timebase; `gop_size` must be >= 2.
+/// `fps == 0` keeps the input timebase; `total_frames` must be in
+/// 2..=`assemble::MAX_TOTAL_FRAMES` and `gop_size` must be >= 2.
 ///
 /// # Safety
 /// `input` must point to `input_len` readable bytes and `out_len` must be

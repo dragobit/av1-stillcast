@@ -55,7 +55,8 @@ pub fn expand_ivf(input: &[u8], params: &ExpandParams) -> Result<Vec<u8>> {
 /// Multi-segment variant: each `SegmentInput` becomes a display segment.
 /// All inputs must share a byte-identical sequence-header payload (same
 /// dimensions/encoder settings); every segment boundary is a shown keyframe.
-/// Total output frames = the sum of segment frame counts.
+/// Total output frames = the sum of segment frame counts; it must be >= 2
+/// and <= `assemble::MAX_TOTAL_FRAMES`, and every segment needs >= 1 frame.
 pub fn expand_ivf_multi(segments: &[SegmentInput], params: &ExpandParams) -> Result<Vec<u8>> {
     anyhow::ensure!(!segments.is_empty(), "no input segments");
 
@@ -93,7 +94,9 @@ pub fn expand_ivf_multi(segments: &[SegmentInput], params: &ExpandParams) -> Res
         &AssembleParams {
             fps: rate_num,
             fps_den: rate_den,
-            total_frames: segs.iter().map(|s| s.frames).sum(),
+            // saturating: assemble_multi validates the total; an unsaturating
+            // sum could overflow before the check runs.
+            total_frames: segs.iter().fold(0, |t, s| t.saturating_add(s.frames)),
             gop_size: params.gop_size,
             decoder_model: params.decoder_model,
         },
