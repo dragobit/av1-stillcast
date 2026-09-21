@@ -156,10 +156,10 @@ fn expand_accepts_obu_and_annexb_inputs() {
 #[test]
 fn expand_scans_past_leading_junk_tus() {
     // Condition-based acceptance: a leading frameless TU (metadata/padding)
-    // doesn't displace the anchor+golden pair. For IVF and Annex-B the junk
-    // TU is skipped entirely, so output stays byte-identical; the OBU-stream
-    // demuxer merges leading frameless OBUs into the first coded TU, so
-    // there it only has to succeed.
+    // doesn't displace the anchor+golden pair. For Annex-B the junk
+    // TU is skipped entirely, so output stays byte-identical; the IVF and
+    // OBU-stream demuxers merge leading frameless OBUs into the first
+    // coded TU, so there it only has to succeed.
     let mut tus = vec![junk_tu()];
     tus.extend(src_tus());
     let params = ExpandParams {
@@ -169,12 +169,15 @@ fn expand_scans_past_leading_junk_tus() {
         decoder_model: false,
     };
     let expected = expand_ivf(SRC, &params).unwrap();
-    for bytes in [ivf_bytes(&tus), stillcast::container::write_annexb(&tus)] {
+    let out = expand_ivf(&stillcast::container::write_annexb(&tus), &params).unwrap();
+    assert_eq!(out, expected);
+    for bytes in [
+        ivf_bytes(&tus),
+        stillcast::container::write_obu_stream(&tus),
+    ] {
         let out = expand_ivf(&bytes, &params).unwrap();
-        assert_eq!(out, expected);
+        assert_eq!(ivf::read(&out).unwrap().frames.len(), 60);
     }
-    let out = expand_ivf(&stillcast::container::write_obu_stream(&tus), &params).unwrap();
-    assert_eq!(ivf::read(&out).unwrap().frames.len(), 60);
 }
 
 #[test]

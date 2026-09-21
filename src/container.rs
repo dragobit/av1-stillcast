@@ -58,6 +58,7 @@ pub fn read(data: &[u8]) -> Result<Input> {
         for (_, tu) in &mut ivf.frames {
             *tu = canonicalize_tu(tu);
         }
+        ivf.frames = merge_frameless_packets(ivf.frames);
         return Ok(Input {
             ivf,
             format: Format::Ivf,
@@ -301,16 +302,74 @@ fn split_obu_stream(data: &[u8]) -> Result<Vec<Vec<u8>>> {
             None => merged.push(pending),
         }
     }
-    Ok(merged
-        .iter()
-        .map(|obus| {
-            let mut tu = Vec::new();
-            for obu in obus {
-                obu.write(&mut tu);
+    Ok(merged.iter().map(|obus| write_tu(obus)).collect())
+}
+
+/// Serialize an OBU list as one temporal-unit byte string.
+fn write_tu(obus: &[Obu]) -> Vec<u8> {
+    let mut tu = Vec::new();
+    for obu in obus {
+        obu.write(&mut tu);
+    }
+    tu
+}
+
+/// Merge frameless IVF packets into their neighbors — the same pass
+/// `split_obu_stream` runs on a section-5 stream, so a muxer that puts a
+/// leading `[TD, seq header]` group in its own packet normalizes
+/// identically in either container. A packet carrying no coded frame is
+/// prepended to the next packet that has one; a trailing frameless packet
+/// attaches to the last real one. A merged packet keeps the coded
+/// packet's timestamp — a frameless packet has no display time of its
+/// own, so `pending_ts` only applies when the pending group is emitted
+/// standalone (no coded packet follows it).
+///
+/// Packets that fail OBU framing pass through with the pending group
+/// flushed ahead of them — the downstream scan reports the real error.
+fn merge_frameless_packets(frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
+    let mut out: Vec<(u64, Vec<u8>)> = Vec::with_capacity(frames.len());
+    let mut pending: Vec<Obu> = Vec::new();
+    let mut pending_ts = 0u64;
+    for (ts, tu) in frames {
+        let Ok(obus) = parse_obus(&tu) else {
+            if pending.is_empty() {
+                out.push((ts, tu));
+            } else {
+                let mut merged = write_tu(&pending);
+                merged.extend_from_slice(&tu);
+                out.push((ts, merged));
+                pending.clear();
             }
-            tu
-        })
-        .collect())
+            continue;
+        };
+        let has_frame = obus
+            .iter()
+            .any(|o| matches!(o.obu_type, ObuType::Frame | ObuType::FrameHeader));
+        if has_frame {
+            out.push((ts, write_tu(&concat_tu(std::mem::take(&mut pending), obus))));
+        } else {
+            if pending.is_empty() {
+                pending_ts = ts;
+            }
+            pending.extend(obus);
+        }
+    }
+    if !pending.is_empty() {
+        match out.pop() {
+            Some((ts, last)) => match parse_obus(&last) {
+                Ok(obus) => out.push((ts, write_tu(&concat_tu(obus, pending)))),
+                Err(_) => {
+                    let mut last = last;
+                    for obu in &pending {
+                        obu.write(&mut last);
+                    }
+                    out.push((ts, last));
+                }
+            },
+            None => out.push((pending_ts, write_tu(&pending))),
+        }
+    }
+    out
 }
 
 /// Join two adjacent TU groups into a single temporal unit. A
@@ -588,6 +647,51 @@ mod tests {
         let obus0 = parse_obus(&input.ivf.frames[0].1).unwrap();
         assert_eq!(obus0[0].obu_type, ObuType::TemporalDelimiter);
         assert_eq!(obus0[1].obu_type, ObuType::SequenceHeader);
+    }
+
+    #[test]
+    fn ivf_leading_frameless_packet_merges_forward() {
+        // The IVF twin of obu_stream_merge_keeps_single_leading_td: a
+        // standalone [TD, seq] packet must merge into the packet carrying
+        // the keyframe, or split_input sees a shown KEY_FRAME with no
+        // sequence header to anchor on.
+        let packets = ivf_packets();
+        let first = parse_obus(&packets[0]).unwrap();
+        assert_eq!(first[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(first[1].obu_type, ObuType::SequenceHeader);
+
+        let mut p0 = Vec::new();
+        first[0].write(&mut p0);
+        first[1].write(&mut p0);
+        let mut p1 = Vec::new();
+        for obu in &first[2..] {
+            obu.write(&mut p1);
+        }
+
+        let mut ivf = ivf::read(SRC_IVF).unwrap();
+        let ts0 = ivf.frames[0].0;
+        let mut frames = Vec::with_capacity(ivf.frames.len() + 1);
+        frames.push((ts0, p0));
+        frames.push((ts0 + 1, p1));
+        frames.extend(ivf.frames.drain(1..));
+        ivf.frames = frames;
+
+        let input = read(&ivf::write(&ivf)).unwrap();
+        assert_eq!(input.format, Format::Ivf);
+        assert_eq!(input.ivf.frames.len(), packets.len());
+        // The merged TU keeps the coded packet's timestamp (the frameless
+        // packet has no display time of its own) and a single leading TD
+        // ahead of the sequence header.
+        assert_eq!(input.ivf.frames[0].0, ts0 + 1);
+        assert_eq!(td_count(&input.ivf.frames[0].1), 1);
+        let obus0 = parse_obus(&input.ivf.frames[0].1).unwrap();
+        assert_eq!(obus0[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(obus0[1].obu_type, ObuType::SequenceHeader);
+        assert!(obus0.iter().any(|o| o.obu_type == ObuType::Frame));
+
+        let (key, golden) = assemble::split_input(&input.ivf).unwrap();
+        assert!(tu_contains(&key, ObuType::SequenceHeader));
+        assert!(!golden.is_empty());
     }
 
     #[test]
