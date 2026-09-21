@@ -48,6 +48,21 @@ impl IvfFile {
 pub fn read(data: &[u8]) -> Result<IvfFile> {
     anyhow::ensure!(data.len() >= 32, "IVF header truncated");
     anyhow::ensure!(&data[0..4] == b"DKIF", "not an IVF file");
+    let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
+    anyhow::ensure!(version == 0, "unsupported IVF version {version}");
+    // Packets start at the declared header length, not at 32: muxers may
+    // pad the header, and skipping the extension is what keeps the first
+    // packet's framing intact.
+    let header_len = u16::from_le_bytes(data[6..8].try_into().unwrap()) as usize;
+    anyhow::ensure!(
+        header_len >= 32,
+        "IVF header length {header_len} is smaller than the fixed 32-byte header"
+    );
+    anyhow::ensure!(
+        header_len <= data.len(),
+        "IVF header length {header_len} exceeds file length {}",
+        data.len()
+    );
     anyhow::ensure!(&data[8..12] == b"AV01", "IVF fourcc is not AV01");
     let width = u16::from_le_bytes(data[12..14].try_into().unwrap());
     let height = u16::from_le_bytes(data[14..16].try_into().unwrap());
@@ -63,7 +78,7 @@ pub fn read(data: &[u8]) -> Result<IvfFile> {
     };
 
     let mut frames = Vec::new();
-    let mut off = 32usize;
+    let mut off = header_len;
     while off < data.len() {
         anyhow::ensure!(off + 12 <= data.len(), "truncated IVF frame header");
         let size = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
@@ -100,4 +115,53 @@ pub fn write(f: &IvfFile) -> Vec<u8> {
         out.extend_from_slice(tu);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC_IVF: &[u8] = include_bytes!("../tests/fixtures/src.ivf");
+
+    /// Re-declare the header length and pad the file so packets start
+    /// there (the fixed header stays 32 bytes; the extension is zeroed).
+    fn with_header_len(data: &[u8], header_len: u16) -> Vec<u8> {
+        let mut out = data.to_vec();
+        out[6..8].copy_from_slice(&header_len.to_le_bytes());
+        if header_len as usize > 32 {
+            let pad = vec![0u8; header_len as usize - 32];
+            out.splice(32..32, pad);
+        }
+        out
+    }
+
+    #[test]
+    fn extended_header_is_honored() {
+        let base = read(SRC_IVF).unwrap();
+        let padded = read(&with_header_len(SRC_IVF, 64)).unwrap();
+        assert_eq!(padded.frames, base.frames);
+        assert_eq!((padded.width, padded.height), (base.width, base.height));
+        assert_eq!(
+            (padded.timebase_den, padded.timebase_num),
+            (base.timebase_den, base.timebase_num)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_header_len_and_version() {
+        let mut bad = SRC_IVF.to_vec();
+        bad[6..8].copy_from_slice(&16u16.to_le_bytes());
+        let err = read(&bad).err().expect("read succeeded").to_string();
+        assert!(err.contains("header length"), "{err}");
+
+        let mut bad = SRC_IVF.to_vec();
+        bad[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+        let err = read(&bad).err().expect("read succeeded").to_string();
+        assert!(err.contains("exceeds"), "{err}");
+
+        let mut bad = SRC_IVF.to_vec();
+        bad[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let err = read(&bad).err().expect("read succeeded").to_string();
+        assert!(err.contains("version"), "{err}");
+    }
 }
