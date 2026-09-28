@@ -36,6 +36,11 @@ HTMLMediaElement seek contract (mid-GOP seeks on show_existing_frame TUs).
 clean stream; on a corrupted stream it prints e.g.
 `zero_bit out of range` / `Failed to parse temporal unit`.
 
+On mp4 outputs carrying an `attached_pic` cover stream, an unscoped
+`-c:v libdav1d` fails with "could not find codec parameters" because it
+also targets the mjpeg/png cover — scope it to the video track:
+`ffmpeg -v error -codec:v:0 libdav1d -i <file.mp4> -map 0:v:0 -f null -`.
+
 ## Building a pre-fix control binary
 
 `git worktree add /tmp/stillcast-old HEAD~1 && cd /tmp/stillcast-old && cargo build`
