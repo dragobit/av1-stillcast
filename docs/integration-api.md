@@ -6,11 +6,18 @@ applications that drive it, so that CLI `make`, an ffmpeg pipeline, and a
 browser app all consume the same contract.
 
 ```
-stillcast core                    owns: AV1 semantics, nothing else
-  ├─ input contract for short AV1 encodes (anchor + golden)
-  ├─ conditional AV1 packet/TU generation (expand)
-  ├─ plan: size ↔ seek policy
-  └─ validation / diagnostics
+stillcast core — true core        assemble: only the two TU generations
+  ├─ shown-frame passthrough      (anchor KF TU + golden TU, verbatim)
+  └─ show_existing_frame synthesis (repeat loop, golden-slot bookkeeping,
+                                    seq-header rewrite for decoder model)
+
+stillcast periphery               core-adjacent; membership debatable —
+                                  see the boundary table below
+  ├─ container sniff + input scan (container::read, split_input)
+  ├─ sequence-header services     (av1C / codec string derivation)
+  ├─ plan / size↔seek policy      (cost model over probe measurements)
+  ├─ validation / diagnostics     (per-TU reasons, info --check)
+  └─ IVF writer                   (the original container adapter)
 
 thin integration API              owns: nothing — just types
   ├─ called from ffmpeg (bsf / pipe)
@@ -27,6 +34,32 @@ The key property: **the core's output is never shaped for one muxer.** It
 produces AV1 temporal units plus the metadata a muxer needs; containers are
 always the adapter's problem — including IVF, which today is the incidental
 return type of `expand_ivf`.
+
+## Core vs periphery — a contested boundary
+
+"stillcast core" is not one thing. The *true* core is `assemble`'s two
+kinds of AV1 generation — passing the two real coded frames through, and
+synthesizing `show_existing_frame` TUs with correct golden-slot
+bookkeeping. Everything around it is periphery, and **where each
+peripheral piece belongs is a legitimate open question** — this design
+takes positions below, but they are defaults to argue against, not axioms:
+
+| periphery piece | case for core side | case for API/app side | this doc's default |
+|---|---|---|---|
+| container sniff (`container::read`: IVF/OBU/Annex-B) | "hand us bytes" is a friendly contract; adapters stay dumb | a bsf adapter receives `AVPacket`s, not a container — the sniff is dead code for it; a bare-TU entry point is needed anyway | keep in periphery, **two entry levels**: raw container bytes *or* an explicit TU list |
+| input scan (`split_input`: anchor/golden acceptance) | it *is* the input contract — the invariant that makes expansion valid; contract enforcement can't be outsourced | — (nobody argues to move it) | core-adjacent, mandatory |
+| seq-header services (av1C, `av01.*` string) | derivation needs the parsed header — already in hand | av1C/codec strings are container-registry knowledge, not AV1 semantics | periphery service the API exposes; core keeps only the parse |
+| decoder-model header splice | already inside `assemble`'s output path (bit-level surgery on its own TUs) | — | stays in true core |
+| plan / cost model | one canonical frontier keeps CLI and browser from drifting apart | pure arithmetic over probe sizes; could live in each app | periphery, exposed via API — one model, many UIs |
+| diagnostics (`TuDiagnostic`, checks) | — | — | periphery, always |
+| timestamps | index×fps is trivial arithmetic | muxers may want to snap to their own timescale | exported by the API as a convenience, computed in periphery |
+| IVF writer | — | it's a container, like any other | adapter, same standing as `mp4.rs` |
+
+The practical consequence of drawing the boundary *inside* "core" rather
+than around it: the integration API ends up exposing some periphery
+(diagnostics, plan) alongside the true core, and the debate reduces to
+"what does `api.rs` re-export" — cheap to revisit without breaking
+adapters.
 
 ## What exists today
 
@@ -82,6 +115,15 @@ pub struct Rejection {
     /// today they only reach the user through anyhow error text.
     pub diagnostics: Vec<TuDiagnostic>,
 }
+```
+
+Per the boundary table, acceptance gets a second entry level for adapters
+that never see a container — an ffmpeg bsf holds `AVPacket`s, not a file:
+
+```rust
+/// Same contract, pre-demuxed input: bare temporal units in decode order.
+pub fn accept_tus(tus: &[TemporalUnit], timebase: Option<Rational>)
+    -> Result<AcceptedStream, Rejection>;
 ```
 
 Why a separate entry point instead of folding this into `expand`:
