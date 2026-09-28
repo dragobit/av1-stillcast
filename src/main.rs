@@ -581,6 +581,80 @@ fn ensure_adts(audio: &Path, work_dir: &Path, bitrate: &str) -> Result<PathBuf> 
     Ok(out)
 }
 
+/// Whether the container carries any video stream (attached pictures
+/// count).
+fn has_video_stream(path: &Path) -> bool {
+    ffprobe_out(path, "stream=codec_type", &["-select_streams", "v"])
+        .map(|s| s.contains("video"))
+        .unwrap_or(false)
+}
+
+/// Mux the expanded IVF video (+ optional audio) into an mp4 via ffmpeg.
+/// `make` uses this so its one-shot output path rides on ffmpeg's muxer
+/// (stream copy, faststart, metadata); the internal writer stays as the
+/// dependency-free fallback used by `expand`.
+///
+/// Audio is stream-copied when already AAC, otherwise transcoded at
+/// `audio_bitrate`. Cover art: the audio's own attached picture wins;
+/// `cover_fallback` (typically the -i image) is attached otherwise.
+fn mux_mp4_ffmpeg(
+    video_ivf: &Path,
+    audio: Option<&Path>,
+    cover_fallback: Option<&Path>,
+    audio_bitrate: &str,
+    output: &Path,
+) -> Result<()> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "ivf",
+        "-i",
+    ])
+    .arg(video_ivf);
+    let mut n_inputs = 1u32;
+    if let Some(a) = audio {
+        cmd.arg("-i").arg(a);
+        n_inputs += 1;
+    }
+    // Prefer an attached picture already inside the audio container; else
+    // attach the fallback image as a third input.
+    let audio_has_pic = audio.map(has_video_stream).unwrap_or(false);
+    let cover_map = match (audio, audio_has_pic, cover_fallback) {
+        (Some(_), true, _) => Some("1:v".to_string()),
+        (Some(_), false, Some(c)) => {
+            cmd.arg("-i").arg(c);
+            Some(format!("{n_inputs}:v"))
+        }
+        _ => None,
+    };
+
+    cmd.args(["-map", "0:v"]);
+    if audio.is_some() {
+        cmd.args(["-map", "1:a"]);
+    }
+    if let Some(cm) = &cover_map {
+        cmd.args(["-map", cm]);
+    }
+    cmd.args(["-c:v", "copy"]);
+    if let Some(a) = audio {
+        if audio_codec(a).as_deref() == Some("aac") {
+            cmd.args(["-c:a", "copy"]);
+        } else {
+            cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
+        }
+        cmd.args(["-map_metadata", "1", "-map_metadata:s:a", "1:s:a"]);
+    }
+    if cover_map.is_some() {
+        cmd.args(["-disposition:v:1", "attached_pic"]);
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(output);
+    run(&mut cmd, "ffmpeg mp4 mux")
+}
+
 /// Language tag of the first audio stream (ISO-639-2, e.g. "eng").
 fn audio_language(path: &Path) -> Option<String> {
     ffprobe_out(path, "stream_tags=language", &["-select_streams", "a:0"])
@@ -779,25 +853,10 @@ fn main() -> Result<()> {
             };
             std::fs::create_dir_all(&work)?;
 
-            let aac = match &audio {
-                Some(a) if is_mp4 => Some(ensure_adts(a, &work, &audio_bitrate)?),
-                _ => None,
-            };
-            // Carry source metadata (language, tags, cover) into the mp4.
-            // Cover falls back to the first still image when the audio has
-            // no attached picture.
-            let meta = match &audio {
-                Some(a) if is_mp4 => Some(probe_meta(
-                    a,
-                    &work,
-                    entries.first().map(|e| e.path.as_path()),
-                )),
-                _ => None,
-            };
-            let alang = match &audio {
-                Some(a) if is_mp4 => audio_language(a),
-                _ => None,
-            };
+            // mp4 is muxed by ffmpeg after expansion (audio copy/transcode,
+            // tags, cover art, faststart all ride on the muxer); .ivf output
+            // stays pure. The audio file is muxed directly — no ADTS
+            // intermediate is needed on this path.
 
             let total_secs = match (duration, &audio) {
                 (Some(d), _) => Some(d),
@@ -821,7 +880,11 @@ fn main() -> Result<()> {
             }
             let budget: Option<u64> = max_size.map(|s| parse_size(&s)).transpose()?;
             let mut last_err: Option<anyhow::Error> = None;
-            let mut chosen: Option<(Vec<u8>, usize, u8, u32)> = None; // bytes,n,slot,crf_used
+            // bytes = expanded IVF; for mp4 the candidate is muxed eagerly so
+            // the budget is checked against the real final size.
+            let mut chosen: Option<(Vec<u8>, usize, u8, u32, u64)> = None;
+            let video_ivf = work.join("video.ivf");
+            let cand_mp4 = work.join("out.mp4");
             for c in &crfs {
                 let mut srcs = Vec::with_capacity(entries.len());
                 for (i, e) in entries.iter().enumerate() {
@@ -834,17 +897,30 @@ fn main() -> Result<()> {
                     &donor,
                     &pairs,
                     &seg_frames,
-                    is_mp4,
+                    false,
                     Some(fps),
                     gop,
-                    aac.as_deref(),
-                    alang.as_deref(),
-                    meta.as_ref(),
+                    None,
+                    None,
+                    None,
                     decoder_model,
                 ) {
                     Ok((bytes, n, slot, _)) => {
-                        let fits = budget.map(|b| bytes.len() as u64 <= b).unwrap_or(true);
-                        chosen = Some((bytes, n, slot, *c));
+                        let size = if is_mp4 {
+                            std::fs::write(&video_ivf, &bytes).context("writing video.ivf")?;
+                            mux_mp4_ffmpeg(
+                                &video_ivf,
+                                audio.as_deref(),
+                                entries.first().map(|e| e.path.as_path()),
+                                &audio_bitrate,
+                                &cand_mp4,
+                            )?;
+                            std::fs::metadata(&cand_mp4)?.len()
+                        } else {
+                            bytes.len() as u64
+                        };
+                        let fits = budget.map(|b| size <= b).unwrap_or(true);
+                        chosen = Some((bytes, n, slot, *c, size));
                         if fits {
                             break;
                         }
@@ -852,24 +928,39 @@ fn main() -> Result<()> {
                     Err(e) => last_err = Some(e),
                 }
             }
-            let (bytes, n, slot, crf_used) = match (chosen, last_err) {
+            let (bytes, n, slot, crf_used, size) = match (chosen, last_err) {
                 (Some(c), _) => c,
                 (None, Some(e)) => return Err(e),
                 (None, None) => unreachable!(),
             };
-            if let (Some(b), _) = (budget, &bytes) {
-                if bytes.len() as u64 > b {
+            if let Some(b) = budget {
+                if size > b {
                     eprintln!(
                         "warning: could not fit {}: best is {} at crf {}",
                         fmt_bytes(b),
-                        fmt_bytes(bytes.len() as u64),
+                        fmt_bytes(size),
                         crf_used
                     );
                 } else if crf_used != crf {
                     eprintln!("note: raised crf to {} to fit {}", crf_used, fmt_bytes(b));
                 }
             }
-            write_output(&output, &bytes, n, slot, gop)?;
+            if is_mp4 {
+                // The accepted candidate is already muxed; move it out.
+                std::fs::rename(&cand_mp4, &output)
+                    .or_else(|_| std::fs::copy(&cand_mp4, &output).map(|_| ()))
+                    .with_context(|| format!("writing {}", output.display()))?;
+                println!(
+                    "wrote {}: {} frames, {} B, golden slot {}, gop {}",
+                    output.display(),
+                    n,
+                    size,
+                    slot,
+                    gop
+                );
+            } else {
+                write_output(&output, &bytes, n, slot, gop)?;
+            }
 
             if !keep_work {
                 let _ = std::fs::remove_dir_all(&work);

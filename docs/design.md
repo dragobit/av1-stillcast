@@ -38,8 +38,10 @@ As an independent subcommand, `encode` is also a composable part for
 pipe-oriented users, e.g.
 `stillcast encode -i jacket.png | stillcast expand --gop 300 | ffmpeg -f ivf -i - -i audio.m4a -c copy out.mp4`.
 
-The hand-rolled MP4 muxer is demoted accordingly: not the only output path,
-but a dependency-free fallback and a verification reference. Distribution
+The hand-rolled MP4 muxer is demoted accordingly: `make` muxes through
+ffmpeg (tags, cover art, faststart ride on the muxer), and the internal
+writer remains only on `expand`'s mp4 output — a dependency-free,
+byte-deterministic fallback and a verification reference. Distribution
 stays one binary with subcommands; splitting into separate tools is
 deferred until the ffmpeg bsf path (below) materializes.
 
