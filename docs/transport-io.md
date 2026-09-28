@@ -98,7 +98,22 @@ The Rust core signature is already the common denominator:
 `fn(&[TemporalUnit]) -> Result<Vec<TemporalUnit>>` for TU-level.
 Every binding above is a projection of one of those two.
 
-### 5. Streaming: explicit non-goal (for now)
+### 5. Naming: generic entry, format-named writers, frozen aliases
+
+Because one function may accept several serializations (sniffed) or emit
+any of them, names must not lie about the format:
+
+| tier | names | rule |
+|---|---|---|
+| **Generic entry points** | `accept_input(&[u8])`, `accept_tus(&[TemporalUnit])`, `expand(..)` | named for the *contract* (bytes-sniffed input, pre-demuxed TUs), never for a container. `expand_ivf` is a counterexample: it reads OBU/Annex-B too — don't repeat that mistake |
+| **Format-specific writers** | `ivf::write`, `mp4` writer, `write_obu_stream`, `write_annexb` | named for exactly what they emit; adapters only |
+| **Compat aliases** | `expand_ivf`, `expand_ivf_multi` | frozen C ABI surface, kept for existing callers. Semantically "`expand` + IVF adapter", and the doc comment already says so — treat as deprecated spellings of the generic API, not the canonical entry |
+
+So the public surface a new adapter should meet is
+`accept_input`/`accept_tus` → `expand` → a writer of choice; the `*ivf`
+names survive only where renaming would break ABI.
+
+### 6. Streaming: explicit non-goal (for now)
 
 The core is `Vec<TU>`-based — whole input in memory, whole output in
 memory. For the actual workloads (a 2-frame input expanded to a known
