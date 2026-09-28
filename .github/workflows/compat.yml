@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: build aomdec (AV1 reference decoder, decode-only)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake nasm
+          sudo apt-get update -qq && sudo apt-get install -y -qq cmake nasm ffmpeg
           git clone --depth 1 https://aomedia.googlesource.com/aom /tmp/aom
           cmake -S /tmp/aom -B /tmp/aom/build -DCMAKE_BUILD_TYPE=Release \
             -DCONFIG_AV1_ENCODER=0 -DENABLE_TESTS=0 -DENABLE_DOCS=0 \
