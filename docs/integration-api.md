@@ -240,8 +240,12 @@ equivalents, timescales, and format quirks.
 
 ## Reference application: browser `make`
 
+Full application design lives in
+[`docs/browser-make.md`](browser-make.md); this section keeps only the
+spec-level mapping the API must satisfy.
+
 With the surfaces above, the browser app is a thin orchestrator:
-WebCodecs → `accept_input` → `plan` → `expand` → Mediabunny.
+WebCodecs → `accept_tus` → `plan` → `expand` → Mediabunny.
 `examples/webcodecs` already proves the encoder side on Chrome 137 (libaom
 software path): chunk 0 = anchor, chunk 1 = valid golden, no hidden frames,
 no drops in quality mode.
