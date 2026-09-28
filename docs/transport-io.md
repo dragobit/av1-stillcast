@@ -35,6 +35,33 @@ Two facts drive the whole design:
 
 ### 1. Canonical wire form: low-overhead OBU, one TU per packet
 
+Why this works as a shared contract — the three ecosystems touch layer 3
+in *different roles*, and low-overhead OBU is the only shape all three
+already speak:
+
+| | what "layer 3" means to it | native form |
+|---|---|---|
+| stillcast | normalization target: containers are opened into a TU list | bytes in any of the 3 accepted serializations |
+| ffmpeg | a demuxer/muxer *format* (`-f obu` in, `-f data`+copy out); bsfs reframe between packets and TUs | files/pipes |
+| Mediabunny | not a file format at all — the *packet contract*: `EncodedPacket.data` must be §5 low-overhead | one packet per TU |
+
+Because each side's layer-3 concept is the same byte sequence seen
+through different API shapes, a pipeline composes without translation:
+
+```
+encoder (ffmpeg/WebCodecs) ── OBU bytes ──► stillcast expand
+                                              │ TU list
+                                              ▼ packets
+Mediabunny mux ◄── OBU packet per TU ──────────┘
+        │  or ffmpeg, via `-f obu` / `-f data`
+        ▼
+      layer 4 (mp4)
+```
+
+Annex-B is an input acceptance path and optional output form, never the
+contract — Mediabunny doesn't speak it, so normalizing to low-overhead
+first is the interoperable route.
+
 The exchange unit between stillcast and any adapter is a **single
 temporal unit serialized in the §5 low-overhead form** — the exact shape
 Mediabunny's `EncodedPacket.data`, ffmpeg's `AVPacket`, and WebCodecs'
