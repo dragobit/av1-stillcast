@@ -581,12 +581,22 @@ fn ensure_adts(audio: &Path, work_dir: &Path, bitrate: &str) -> Result<PathBuf> 
     Ok(out)
 }
 
-/// Whether the container carries any video stream (attached pictures
-/// count).
-fn has_video_stream(path: &Path) -> bool {
-    ffprobe_out(path, "stream=codec_type", &["-select_streams", "v"])
-        .map(|s| s.contains("video"))
+/// Whether the container's video streams are attached pictures (cover
+/// art). A *real* video stream inside an audio container (e.g. a music
+/// video's mp4) is not a cover and must not be copied into the output.
+fn has_attached_pic(path: &Path) -> bool {
+    ffprobe_out(path, "stream=disposition", &["-select_streams", "v"])
+        .map(|s| s.contains("attached_pic=1") && !s.contains("attached_pic=0"))
         .unwrap_or(false)
+}
+
+/// Whether the image is embeddable as an mp4 attached picture — jpeg/png
+/// only; bmp/webp/... would fail the mux, and the file is fine uncovered.
+fn is_mp4_coverable(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| image_dtype(&b))
+        .is_some()
 }
 
 /// Mux the expanded IVF video (+ optional audio) into an mp4 via ffmpeg.
@@ -621,11 +631,12 @@ fn mux_mp4_ffmpeg(
         n_inputs += 1;
     }
     // Prefer an attached picture already inside the audio container; else
-    // attach the fallback image as a third input.
-    let audio_has_pic = audio.map(has_video_stream).unwrap_or(false);
+    // attach the fallback image as a third input when it is an mp4-legal
+    // cover type (jpeg/png).
+    let audio_has_pic = audio.map(has_attached_pic).unwrap_or(false);
     let cover_map = match (audio, audio_has_pic, cover_fallback) {
         (Some(_), true, _) => Some("1:v".to_string()),
-        (Some(_), false, Some(c)) => {
+        (Some(_), false, Some(c)) if is_mp4_coverable(c) => {
             cmd.arg("-i").arg(c);
             Some(format!("{n_inputs}:v"))
         }
@@ -634,7 +645,9 @@ fn mux_mp4_ffmpeg(
 
     cmd.args(["-map", "0:v"]);
     if audio.is_some() {
-        cmd.args(["-map", "1:a"]);
+        // First audio stream only: extra tracks (commentary, secondary
+        // audio, non-mp4-legal codecs) must not leak into the output.
+        cmd.args(["-map", "1:a:0"]);
     }
     if let Some(cm) = &cover_map {
         cmd.args(["-map", cm]);
@@ -646,7 +659,7 @@ fn mux_mp4_ffmpeg(
         } else {
             cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
         }
-        cmd.args(["-map_metadata", "1", "-map_metadata:s:a", "1:s:a"]);
+        cmd.args(["-map_metadata", "1", "-map_metadata:s:a:0", "1:s:a:0"]);
     }
     if cover_map.is_some() {
         cmd.args(["-disposition:v:1", "attached_pic"]);
