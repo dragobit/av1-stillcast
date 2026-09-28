@@ -109,7 +109,10 @@ Staged delivery to ffmpeg-centric users:
 Beyond a single tool/distribution: a VP9 variant (VP9 also has
 `show_existing_frame`, reaching older AV1-less hardware) and library
 embedding for server-side on-demand generation are open possibilities the
-layer split keeps cheap.
+layer split keeps cheap. The thin layer between core and applications —
+accept/expand/plan/diagnostics as data, with `make` and a browser app as
+peer consumers — is designed in
+[`docs/integration-api.md`](integration-api.md).
 
 ## 5. Input-contract hardening
 
