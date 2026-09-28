@@ -1,4 +1,4 @@
-# One-time setup (e.g., install system tools, global CLIs).
+# One-time setup (e.g., install system tools, global CLIs).One-time setup (e.g., install system tools, global CLIs).
 initialize: |
   # Rust toolchain + ffmpeg (e2e encode/decode verification) + playwright
   # + player binaries (compat_players.sh) + playwright firefox build
@@ -18,6 +18,7 @@ initialize: |
     cmake --build ~/work/aom/build --target aomdec dump_obu -j"$(nproc)"
   fi
 # Install project dependencies (runs during builds, surfaced to agent at session start).
+# Install project dependencies (runs during builds, surfaced to agent at session start).
 maintenance: |
   cargo fetch
 knowledge:
@@ -29,7 +30,8 @@ knowledge:
       cargo test && ./scripts/e2e.sh
   - name: browser-test
     contents: |
-      BROWSER=chrome CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/demo.mp4
+      BROWSER=chrome BROWSER=chrome CDP_URL=http://localhost:29229 python3 scripts/browser_seek_test.py examples/demo.mp4
+      (BROWSER=chrome is required — the preset BROWSER=/opt/.devin/browser.sh is rejected by the script)
   - name: notes
     contents: |
       ffmpeg provides libaom-av1 (encode) and libdav1d (decode-verify); the e2e
