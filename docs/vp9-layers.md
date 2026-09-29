@@ -383,7 +383,29 @@ WebCodecs/libvpx の KF パケット ──► [KF][SE][SE]… のパケット�
 
 つまり、Mediabunny の `EncodedVideoPacketSource('vp9')` は「serialization 層を API 化したもの」と捉えるのが正確で、AV1 の `low-overhead OBU` がその役割を果たしていたのに対し、VP9 では「フレーム列をそのままパケットとして渡す」だけになる。
 
+### 3 者相互入出力 — AV1 の low-overhead OBU の相当物は何か
+
+AV1 では「低オーバーヘッド OBU ストリーム」が stillcast・ffmpeg・Mediabunny の 3 者が共有する中間表現だった。VP9 では **ファイル形式として全員が読み書きできる直列化は存在しない** ので、共有中間表現は「**フレーム境界つきのパケット列**」という形で現れ、ファイル実体が **IVF**、API 実体が **パケットリスト** という 2 面を持つ。
+
+| 経路 | AV1 | VP9 |
+|---|---|---|
+| stillcast 内部表現 | `Vec<TU バイト列>`(低オーバーヘッド OBU) | `Vec<フレームバイト列>`(境界は配列の要素) |
+| → ffmpeg(入力) | `-f obu -i -` で読める | **`-f ivf -i -` で読める**(生連結は不可 → IVF レコードで区切る) |
+| ffmpeg → stillcast(出力) | `-f data` + `-c:v copy` で OBU バイト列を取れる | `-f ivf -c:v copy` でフレーム列を取れる(12 B ヘッダを剥がす) |
+| → Mediabunny | `EncodedPacket.data` = 1 TU | `EncodedPacket.data` = 1 フレーム(直列化しない、配列のまま渡す) |
+| Mediabunny → stillcast | `EncodedPacket.data` = 1 TU | `EncodedPacket.data` = 1 フレーム(同上) |
+
+つまり「低オーバーヘッド OBU 相当」は **「長さ前置きのフレーム列」** で、AV1 が OBU の `obu_size` で区切られていたのと同じ役割を、VP9 では「配列の要素境界」または「IVF の 12 B レコードヘッダ」が担う。中身のバイト列(非圧縮ヘッダ+ペイロード)は 3 者とも**完全に同一**で、差は区切り方だけ:
+
+- **ffmpeg**: AVPacket は 1 圧縮フレームを持ち、ファイル直列化は `-f ivf`(素)または `-f webm`/`-f matroska`/`-f mp4`(リッチ)。`-f vp9` の生 demuxer/muxer は存在しないので、生バイト列を ffmpeg に流す経路はない。
+- **Mediabunny**: パケット API がフレーム境界を保持するので直列化は不要。ファイルへの出入りは webm/mkv/mp4(IVF 非対応、自前 DKIF アダプタが要る)。
+- **stillcast**: `ExpandedStream.packets` に相当する型を `Vec<Vec<u8>>`(=フレーム列)とすれば、ffmpeg 側は IVF 読み書きで、Mediabunny 側はパケットのまま、両方にそのまま橋渡しできる。
+
+実務的な結論: **VP9 の相互入出力形式 = 「フレームのバイト列の配列」であり、ファイルにするなら IVF**。`.obu`/`.av1b` 相当の「生直列化をそのまま保存する」経路は存在しない(生連結は ffprobe ですら読めないと確認済み)ので、AV1 で `out.obu` を介していた中間ファイルの位置には `.ivf` を置く。`codec:` 設定文字列に相当するのは `vp09.*`(KF 非圧縮ヘッダから生成できるが、Mediabunny は codec 文字列から構築するので渡すだけでよい)。
+
 ---
+
+## 付録 A. 検証コマンド
 
 ```bash
 # 素材生成(VP9 60 フレーム)
