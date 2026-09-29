@@ -227,6 +227,8 @@ libvpx-vp9 で作った通常エンコード (keyframe 1 枚 + 手作り show_ex
 
 stillcast-vp9 は最も実現性の高い派生。~1 B/frame は AV1 の ~6 B/TU よりさらに小さく、golden 不要化で入力契約も単純化される。唯一の実質的課題は「libvpx/ffmpeg 経由で任意の画像から keyframe を生成し、これを show_existing で再表示する」までのパイプライン — これは stillcast の orchestration 層をほぼそのまま流用できる。
 
+> 関連: 二段階処理としての要件は [cross-codec-two-stage.md](cross-codec-two-stage.md) §2.1、層モデルと Mediabunny/ffmpeg との相互入出力は [vp9-layers.md](vp9-layers.md)、ブラウザ WebCodecs 側のエンコード可否と Mediabunny 経路の E2E 検証(decode/remux/ブラウザ再生まで済)は [research-vp9-mediabunny.md](research-vp9-mediabunny.md) を参照。
+
 ### 3.2 AV2 (AVM) — プリミティブ存続、エンコーダ未到達
 
 AV2 の Bitstream & Decoding Process Specification v1.0.0 (av2.aomedia.org 公開) では、show-existing 機能が `OBU_REGULAR_SEF` / `OBU_LEADING_SEF` という専用 OBU タイプとして存続している。AVM (AV2 参照ソフトウェア) のコードベースは AV1 を継承しており、show_existing_frame の機構も保持されている (CWG-F356 "Clarification for the show existing frame obu" 等のドラフト履歴が確認できる)。

@@ -349,7 +349,7 @@ VP9 では「serialization の対応物が IVF またはコンテナ内サンプ
 const video = new EncodedVideoPacketSource('vp9');
 await video.add(new EncodedPacket(kfBytes, 'key', t), {
   decoderConfig: { codec: 'vp09.00.31.08', codedWidth: w, codedHeight: h,
-                   colorSpace: {...} },   // description: VP9 は不要(後述)
+                   colorSpace: {...} },   // description 不要(vpcC は Mediabunny が構築)
 });
 await video.add(new EncodedPacket(sePacket, 'delta', t)); // 1 B の 0x88 パケット
 ```
@@ -358,10 +358,10 @@ await video.add(new EncodedPacket(sePacket, 'delta', t)); // 1 B の 0x88 パケ
 
 | AV1 でのやり取り | VP9 でのやり取り |
 |---|---|
-| `EncodedPacket.data` = 1 TU(低オーバーヘッド OBU 列、先頭に TD 可) | `EncodedPacket.data` = **1 圧縮フレーム**(TU に相当する束ねは存在しない。1 パケット = 1 フレーム = 1 デコード/表示ステップ) |
+| `EncodedPacket.data` = 1 TU(低オーバーヘッド OBU 列、先頭に TD 可) | `EncodedPacket.data` = **1 raw VP9 frame**(Bitstream spec §6 とレジストリが明示。TU に相当する束ねは存在しない。1 パケット = 1 フレーム = 1 デコード/表示ステップ) |
 | codec 文字列 `av01.P.LLT.DD…` | codec 文字列 `vp09.PP.LL.DD…`(mp4 仕様と同一の vp09 形式。WebM 出力時は `V_VP9` に写像される) |
-| `description`(av1C)は不要(検証済み) | VP9 の WebM CodecPrivate は空、mp4 の vpcC は codec 文字列+colorSpace から構築される設計。description の要否はレジストリ次第(AV1 と同じく不要の見込み。要検証) |
-| `keyframes`(stss 相当)→ `type:'key'` | keyframe パケットに `type:'key'`、SE パケットに `type:'delta'`。SE は表示指示のみだが、パケットの key/delta 区別は「デコードエントリポイントか」なので、SE は delta で正しい(SE から seek しても参照先がなければ描けない) |
+| `description`(av1C)は不要(検証済み) | **`description` 不要と確認済み**(Mediabunny が codec 文字列+colorSpace から vpcC を自分で構築。WebM の CodecPrivate は空)— [research-vp9-mediabunny.md](research-vp9-mediabunny.md) で codec registry を照合済み |
+| `keyframes`(stss 相当)→ `type:'key'` | keyframe パケットに `type:'key'`、SE パケットに `type:'delta'`。SE は表示指示のみだが、レジストリの要件は **`'key'` は `frame_type==KEY_FRAME` のパケット限定**(Bitstream spec §7.2)なので、SE を `'key'` で渡すのは契約違反になる。key/delta 区別は「デコードエントリポイントか」であり、SE は delta で正しい(SE から seek しても参照先がなければ描けない) |
 | タイムスタンプは `timestamp`/`duration`(fps 由来) | 同じ。VP9 はフレームに時刻を持たないため、この API フィールドが唯一の時刻の出どころ |
 
 ### stillcast の処理で何が変わるか
@@ -376,8 +376,10 @@ WebCodecs/libvpx の KF パケット ──► [KF][SE][SE]… のパケット�
 
 ### 残る注意点
 
-- **superframe**: libvpx が alt-ref を束ねると「1 パケット = 複数フレーム」になる。Mediabunny のパケットはコンテナの 1 サンプルになるので、superframe は「1 サンプル内に複数表示ステップ」を許容する(WebM/mkv は構造上有効)が、シーク粒度やフレーム数カウントがずれる。alt-ref を切って 1:1 に保つのが安全。
-- **description の扱い**: `decoderConfig.description` が VP9 で要求されるかは Mediabunny の codec registry 次第(AV1 では不要と検証済み)。要確認だが、WebM 出力では CodecPrivate が空なので必要にならない見込み。
+- **superframe**: libvpx が alt-ref を束ねると「1 パケット = 複数フレーム」になる。レジストリの要件は 1 パケット = 1 フレームなので、束ねられたまま渡すと契約違反——末尾の superframe index で分割して個別パケットにする必要がある(実測では WebCodecs/ffmpeg 出力で未観測だが、保険として splitter を持つ)。alt-ref を切って 1:1 に保つのが最も安全。
+- **description の扱い**: ~~要確認~~ → **不要と確認済み**。Mediabunny の codec registry は VP9 に `description` を要求せず、mp4 では codec 文字列 `vp09.*`+colorSpace から vpcC を自分で構築する(av1C と同じパターン。詳細は [research-vp9-mediabunny.md](research-vp9-mediabunny.md))。WebM では CodecPrivate が空なのでそもそも持つ物がない。
+- **パケット型の強制**: レジストリは `EncodedPacket.data` = one raw VP9 frame(Bitstream spec §6)、かつ `'key'` は `frame_type == KEY_FRAME` のみ(§7.2)と定める。SE パケット(`0x88`)は KEY_FRAME ではないので常に `'delta'` で渡す。
+- **Stage A 素材採取側の対応資料**: ブラウザ WebCodecs での VP9 エンコード可否(profiles、`prefer-hardware` 不可、Firefox が同一静止画で 26–31 B/フレームと最良、Safari は要 isConfigSupported ゲート)は [research-vp9-mediabunny.md](research-vp9-mediabunny.md) が計測済み。1 バイト SE パケットの libvpx デコード・WebM/MP4 remux・ブラウザ再生・Mediabunny mux までの E2E 検証済み(`scripts/vp9_show_existing_poc.py`)。
 - **出力先**: `EncodedVideoPacketSource('vp9')` は `.webm`(V_VP9)と `.mp4`(vp09)の両方に流せる。IVF は Mediabunny の出力形式にないので、IVF 出力が欲しければ別途 DKIF ヘッダを書く小さなアダプタを自前で持つ(= ffmpeg の `-f ivf` と同じ責務)。
 - **入力側**: Mediabunny の `Input` は webm/mkv/mp4 等を demux するが、**IVF を demux する入力はない**。`.ivf` を入力に取る場合は DKIF+12B レコードを読む小さなパーサを自前で持つか、ffmpeg 側で demux してパケット列にしてから渡す。
 

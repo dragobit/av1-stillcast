@@ -178,8 +178,9 @@ stillcast の Stage B は「1 画像 → 1 セグメント」をプレイリス�
 - **Stage A 契約**: キーフレームパケット 1 つだけ。`show_existing_frame` が再表示対象に showable 制約を課さないため、keyframe をそのまま指せる。非圧縮ヘッダの残り(サイズ、同期コード等)は SE パケットでは不要。
 - **繰り返しユニット**: `frame_marker(2)=10, profile(1)=0, show_existing_frame(1)=1, frame_to_show_map_idx(3)` の計 8 ビット = `0x88`。**一切のカウンタを持たない**完全定数 1 バイト。
 - **アンカー複製**: keyframe が全参照バッファを自身にリフレッシュするため、同じバイト列を GOP 毎に配置可能。
-- **実検証**: `[KF clone] + [0x88]×3` を 2 GOP 連結した IVF(8 フレーム,57 KB)を ffmpeg でデコード → **8/8 フレームがピクセル一致、エラーなし**。
+- **実検証**: `[KF clone] + [0x88]×3` を 2 GOP 連結した IVF(8 フレーム,57 KB)を ffmpeg でデコード → **8/8 フレームがピクセル一致、エラーなし**。別系統の検証として [research-vp9-mediabunny.md](research-vp9-mediabunny.md)(PR #51、main マージ済み)は `[KEY_FRAME, INTER]` 実エンコード出力の後に 1 B SE パケットを配置し、libvpx デコードで framemd5 が golden INTER とビット一致、WebM/MP4 remux、Chromium/Firefox で再生・シーク、Mediabunny `EncodedVideoPacketSource('vp9')` での mux まで E2E 確認している(`scripts/vp9_show_existing_poc.py`)。
 - **Stage B のビット作業**: ゼロ。純粋なバイト列書き出しのみ。全コーデック中で最小実装。
+- **要件の補強(KF 直後以外の SE)** — PR #51 との照合で明確化: 上の「KF 1 枚契約」は「KF が全 8 スロットを自身にリフレッシュするので SE の `frame_to_show_map_idx` は任意値で合法」に依存する。**表示対象を KF でなく INTER(golden)にする拡張形 `[anchor KF, golden INTER] + SE×N` では、SE の idx はその INTER がリフレッシュしたスロットに合わせる必要がある** — つまりアセンブラは golden INTER の非圧縮ヘッダから `refresh_frame_flags`(8 bit)をパースして採番スロットを決める。AV1 の「golden スロット走査」に相当する作業がこの場合だけ復活する(AV1 と違い必須ではなく、KF-only 構成を取れば回避できる)。また仕様 §8 上、SE が指せるのは「既にデコード済みの絵を持つスロット」のみであり、エンコーダが `show_frame=0` の隠しフレーム(alt-ref)を出した場合の pick-golden スキャンで弾く必要がある点も同文書の open questions に整理済み。
 - **結論**: AV1 より単純な二段階処理。素材 1 ユニット + 定数繰り返しのみ。vp9stillcast として最も容易に移植可能な対象。
 
 ### 2.2 H.264 — 条件スキーマテンプレートだが二段階は成立 ✓実証済み
