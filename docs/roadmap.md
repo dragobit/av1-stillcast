@@ -132,3 +132,10 @@ with per-TU "nearest miss" diagnostics. Remaining direction: encode ~1 s
 of input frames for drop tolerance (already the `encode` recipe);
 probe-verify per environment. Full analysis:
 [`docs/input-contract.md`](input-contract.md).
+
+## 6. Stage-1 quality preview
+
+Pixel quality is fully decided once the coded frames exist — stage 2
+adds no picture data. Decision record for a preview that decodes the
+stage-1 frames to PNG (codec-agnostic, pixel-faithful, ~zero added
+time): [`docs/still-preview.md`](still-preview.md). CLI/API shape open.
