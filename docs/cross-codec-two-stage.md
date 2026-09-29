@@ -95,7 +95,70 @@ AV1 では「キーフレーム + ゴールデン」の 2 ユニットが必須�
 
 これは重要な発見である。**「エンコーダから繰り返し用ユニットを採取する」のではなく「アセンブラが繰り返しユニットを工場生産する」**のが正しい一般化であり、AV1 の golden だけが例外的にエンコーダ供給を要求する。結果として Stage A の入力契約は AV1 より他コーデックの方が緩い。
 
-### 1.5 速度特性の由来
+### 1.5 繰り返しユニットのビットレイアウト(実検証済み)
+
+Stage B が「合成」または「複製」するユニットの中身を、実際に本セッションで生成・デコード確認したバイト列のレベルで示す。
+
+**VP9 の繰り返しユニット(1 バイト定数)**
+
+```
+0x88 = 10 0 0 1 000
+       │  │ │ │ └ frame_to_show_map_idx = 0(スロット 0 = 直前 keyframe)
+       │  │ │ └ show_existing_frame = 1
+       │  │ └ profile_high = 0
+       │  └ profile_low = 0(profile 0 = 2 ビットで 00)
+       └ frame_marker = 2(先頭 2 ビット)
+```
+
+keyframe 直後は全 8 スロットがその keyframe を指すので `frame_to_show_map_idx` は常に 0 でよい。
+
+フレーム番号・時刻・サイズを一切持たないため、**この 1 バイトをそのまま何度でも並べられる**。コンテナ(IVF/mp4)がタイムスタンプを与えるだけで各パケットが 1 フレームとして表示される。
+
+**H.264 の繰り返しユニット(11 バイトテンプレート、CAVLC)**
+
+```
+00 00 00 01 | 61 | RBSP
+              │     ├ first_mb_in_slice      ue(0)
+  ref_idc=3 ──┘     ├ slice_type             ue(0) = P
+  type=1            ├ pic_parameter_set_id   ue(0)
+                    ├ frame_num              u(4)   ← カウンタ
+                    ├ num_ref_idx_active_override_flag  u(1)=1
+                    ├ num_ref_idx_l0_active_minus1      ue(0) (参照=直前のみ)
+                    ├ ref_pic_list_modification_flag_l0 u(1)=0
+                    ├ luma_log2_weight_denom            ue(0)  ┐
+                    ├ chroma_log2_weight_denom          ue(0)  │ weighted_pred_flag=1 のため必須
+                    ├ luma_weight_l0_flag               u(1)=0 │
+                    ├ chroma_weight_l0_flag             u(1)=0 ┘
+                    ├ adaptive_ref_pic_marking_mode_flag u(1)=0
+                    ├ slice_qp_delta                    se(0)
+                    ├ disable_deblocking_filter_idc     ue(0)  ┐
+                    ├ slice_alpha_c0_offset_div2        se(0)  │ deblocking_filter_control_
+                    ├ slice_beta_offset_div2            se(0)  ┘ present_flag=1 のため必須
+                    └ mb_skip_run                       ue(1600) = 全 MB スキップ
+```
+
+640×640 = 1600 マクロブロックのスキップ宣言が `ue(1600)` の Exp-Golomb 3 バイトで済むため、全体が 11 B に収まる。**太字のカウンタ `frame_num` だけを GOP 通して単調増加させればよい**——それ以外のフィールドは入力画像にも GOP 内位置にも依存しない固定値であり、これが「テンプレート + カウンタ書き込み」が成立する理由である。ただし、上のフィールドリスト自体が SPS/PPS のフラグ(`pic_order_cnt_type`, `frame_mbs_only_flag`, `weighted_pred_flag`, `deblocking_filter_control_present_flag`, `entropy_coding_mode_flag`)で変形するため、テンプレートは「設定を解決して生成する」ものであり、固定バイト列ではない。
+
+**AV1 の繰り返しユニット(≈6 B、stillcast 現行実装)**
+
+```
+TD OBU(2 B: OBU ヘッダ + temporal_id) + FRAME_HEADER OBU(3-4 B: show_existing_frame=1 + frame_to_show_map_idx)
+```
+
+セグメント内では golden スロット番号が固定なので、全 SE TU がバイト同一 = 純粋複製。セグメントをまたぐと golden_slot が変わり得るため、テンプレートの 3 ビットだけが変わる境界は存在する。
+
+### 1.6 複数画像プレイリストでの二段階処理
+
+stillcast の Stage B は「1 画像 → 1 セグメント」をプレイリスト状に連結する構造も持つ(実装上、画像毎に `encode` → `make-stream` → `concat`)。二段階処理の観点では、これは **Stage A を画像数 N 回実行し、Stage B が N セグメントのバイト列を連結する**形になる。成立条件は R6(設定ユニットのバイト一致)であり、ここに面白い性質がある:
+
+- **H.264/HEVC**: SPS/PPS の内容は画像内容に依存せず、解像度・プロファイル・レベル・エンコード設定だけで決まる。同じ設定の x264/x265 は画像が違ってもバイト同一の SPS/PPS を出す(決定的エンコーダ)ので、正準化は自動的に成立する。ただし各セグメントの先頭は IDR なので、スキップスライスの frame_num カウンタは「前セグメント最終値からの継続」か「IDR 越えのリセット許容」かを Stage B が管理する必要がある(後者は IDR 直後なら合法)。
+- **MPEG-4/MPEG-2**: VOL/シーケンスヘッダも同様に設定由来で正準化可能。
+- **VP9**: シーケンスヘッダが存在しないため、キーフレームの非圧縮ヘッダ(サイズ・プロファイル・色空間)が一致すればよい。同じ画像サイズ・同じエンコード設定なら一致する。
+- **AV1**: seq header の一致に加え、セグメント境界で golden スロット番号が変わりうるため、SE TU の `frame_to_show_map_idx` がセグメント毎に再解決される。stillcast では golden_slot 走査がこれを担当している。
+
+つまり**複数画像プレイリストでも二段階処理の構造は維持される**が、カウンタ管理と golden 再解決だけはコーデック別に必要になる。
+
+### 1.7 速度特性の由来
 
 「エンコード 1 回 + memcpy N 回」という構造が超高速の正体である。Stage B の 1 フレームあたりコストは:
 
@@ -291,7 +354,7 @@ AV1 では全セグメントで seq header がバイト一致する必要があ�
 を Annex-B H.264 として格納 → ffmpeg デコード:
 
 - 3 IDR + 6 skip-P を受理、`no frame!` エラーなし(9 パケット → 9 coded フレーム、ffmpeg が末尾に +1 フレームを drain して 10 フレーム出力、全てピクセル一致)
-- skip P スライスは **11 B**(`00 00 00 01` + 7 B RBSP)
+- skip P スライスは **11 B**(`00 00 00 01` 4 B + NAL ヘッダ 1 B + RBSP 6 B)
 - IDR AU はバイト列の完全複製(27.8 KB × 3)
 
 **Stage A**: x264 の SPS/PPS+IDR AU のみ採取。**Stage B**: IDR 複製 + 11 B テンプレートに frame_num を書き込み。ただしテンプレートのフィールド集合は SPS/PPS のフラグに依存し、実際に 4 回の仕様読み違い(poc_type=2 に POC 書き込み, field_pic_flag の誤配, ref_pic_list_modification の順序, pred_weight_table の分母, deblocking パラメータ)を経て正当な構造を確定した。この過程自体が「H.264 の Stage B は SPS/PPS スキーマ解決を必須とする」という実証である。
