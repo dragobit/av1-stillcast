@@ -302,8 +302,10 @@ gate becomes a mimeType filter.
    browser app = `examples/mediabunny/` static page consuming them.
 4. **browser `make` end-to-end** — encode → expand → Mediabunny mux, with
    audio copy/transcode, tags, language, covr cover, faststart.
-5. **ffmpeg bsf** (`av1_stillcast`) — the third consumer; validates the
-   API from the other direction.
+5. ~~**ffmpeg bsf** (`av1_stillcast`) — the third consumer; validates the
+   API from the other direction.~~ **Deferred**: pipe mode already covers
+   the ffmpeg pipeline; revisit if a use case needing in-process expansion
+   emerges.
 6. **compat sweep** — `docs/compat.md` matrix on browser-muxed outputs.
 
 Validation throughout reuses existing harnesses: `info --check` →

@@ -99,12 +99,17 @@ Staged delivery to ffmpeg-centric users:
   `include/stillcast.h`). Build emits `libstillcast.{so,a}` via the
   `cdylib` crate-type. Prerequisite for in-process embedding (bsf,
   GStreamer element, server-side use).
-- [ ] **ffmpeg bitstream filter** — `av1_stillcast` bsf
+- ~~[ ] **ffmpeg bitstream filter** — `av1_stillcast` bsf
   (`-bsf:v av1_stillcast=gop=300:duration=3600`), parameters via
   `AVOption`/`AVClass`. Two delivery shapes: an FFmpeg fork/static build
   that calls the C ABI above (`libavcodec/bsf/av1_stillcast.c` as a thin
   wrapper), or a C port of the assembler if upstreaming is the goal
-  (upstream ffmpeg takes no Rust dep — decide by distribution target).
+  (upstream ffmpeg takes no Rust dep — decide by distribution target).~~
+  **Deferred**: pipe mode already composes the same pipeline with stock
+  ffmpeg, so a bsf adds little new capability for its implementation cost
+  (thin C wrapper in a fork build, or a full C port for upstreaming).
+  If a use case emerges that genuinely needs in-process expansion, speak
+  up and this item comes back.
 
 Beyond a single tool/distribution: a VP9 variant (VP9 also has
 `show_existing_frame`, reaching older AV1-less hardware) and library

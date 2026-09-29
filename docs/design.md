@@ -163,8 +163,8 @@ Delivery to ffmpeg-centric users is staged, each stage standing on its own:
    it (`stillcast_expand`, `stillcast_free`, `stillcast_last_error`,
    `include/stillcast.h`). `cargo build --release` emits
    `libstillcast.{so,a}` (crate-type `cdylib`).
-3. **ffmpeg bitstream filter** — the transform maps cleanly onto a bsf
-   (same shape as `av1_metadata`):
+3. ~~**ffmpeg bitstream filter**~~ (**deferred**) — the transform maps
+   cleanly onto a bsf (same shape as `av1_metadata`):
 
 ```bash
 # one pipeline: libaom encodes the 2 real frames, bsf expands the stream
@@ -184,6 +184,10 @@ to a pipe stage's, the layer split above is what makes this path cheap.
 Delivery splits by target: a fork/static build calls the C ABI (Rust logic
 reused verbatim); upstreaming requires a C port since ffmpeg takes no Rust
 dependency — decide when the distribution target is known.
+
+*Deferred*: pipe mode (stage 1) already composes the same pipeline with
+stock ffmpeg, so a bsf buys little new capability for its implementation
+cost. Revisit if an in-process use case emerges.
 
 Beyond a single tool, the same technique generalizes: VP9 has a
 `show_existing_frame` equivalent, opening a variant for older hardware
